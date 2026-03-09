@@ -157,13 +157,31 @@ let pool;
 
 function getPool() {
   if (!pool) {
-    const host = process.env.MYSQL_HOST || "localhost";
-    const user = process.env.MYSQL_USER || "root";
-    const password = process.env.MYSQL_PASSWORD || "";
-    const database = process.env.MYSQL_DATABASE || "lms";
-    pool = mysql.createPool({ host, user, password, database });
+    const url = process.env.MYSQL_URL || process.env.DATABASE_URL;
+    if (url) {
+      pool = mysql.createPool({ uri: url, connectTimeout: 15000 });
+    } else {
+      const host = process.env.MYSQL_HOST || "localhost";
+      const port = process.env.MYSQL_PORT ? Number(process.env.MYSQL_PORT) : 3306;
+      const user = process.env.MYSQL_USER || "root";
+      const password = process.env.MYSQL_PASSWORD || "";
+      const database = process.env.MYSQL_DATABASE || "lms";
+      pool = mysql.createPool({
+        host,
+        port,
+        user,
+        password,
+        database,
+        connectTimeout: 15000,
+      });
+    }
   }
   return pool;
+}
+
+function isConnectionError(err) {
+  const msg = err && (err.message || err.code || "");
+  return /ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET|connect/i.test(String(msg));
 }
 
 app.get("/api/health", (req, res) => {
@@ -204,7 +222,10 @@ app.post("/api/auth/login", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /api/auth/login error:", err);
-    res.status(500).json({ error: String(err.message) });
+    const message = isConnectionError(err)
+      ? "Database unavailable. Please try again later."
+      : (err && err.message) || "Login failed";
+    res.status(500).json({ error: message });
   }
 });
 
@@ -242,7 +263,10 @@ app.post("/api/auth/login/teacher", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /api/auth/login/teacher error:", err);
-    res.status(500).json({ error: String(err.message) });
+    const message = isConnectionError(err)
+      ? "Database unavailable. Please try again later."
+      : (err && err.message) || "Login failed";
+    res.status(500).json({ error: message });
   }
 });
 
