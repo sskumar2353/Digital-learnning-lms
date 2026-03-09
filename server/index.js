@@ -188,6 +188,21 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true });
 });
 
+// Quick DB connectivity check (open in browser: /api/db-check)
+app.get("/api/db-check", async (req, res) => {
+  try {
+    const db = getPool();
+    await db.query("SELECT 1");
+    res.json({ ok: true, message: "Database connected" });
+  } catch (err) {
+    console.error("DB check failed:", err.message);
+    res.status(500).json({
+      ok: false,
+      error: isConnectionError(err) ? "Database connection failed" : err.message,
+    });
+  }
+});
+
 app.post("/api/auth/login", async (req, res) => {
   const db = getPool();
   const { email, password } = req.body || {};
