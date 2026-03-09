@@ -1,6 +1,14 @@
-const API_BASE = typeof import.meta.env !== "undefined" && import.meta.env.VITE_API_URL
-  ? import.meta.env.VITE_API_URL
-  : "";
+// Use VITE_API_URL if set; otherwise same origin (works when API is served from same host, e.g. Railway)
+function resolveApiBase(): string {
+  const fromEnv =
+    typeof import.meta.env !== "undefined" && import.meta.env.VITE_API_URL
+      ? import.meta.env.VITE_API_URL
+      : "";
+  if (fromEnv) return fromEnv;
+  if (typeof window !== "undefined" && window.location?.origin) return window.location.origin;
+  return "";
+}
+const API_BASE = resolveApiBase();
 
 export interface AllDataResponse {
   schools: Array<{ id: string; name: string; code: string; district: string; mandal?: string; teachers: number; students: number; classes: number; sessionsCompleted: number; activeStatus: boolean }>;

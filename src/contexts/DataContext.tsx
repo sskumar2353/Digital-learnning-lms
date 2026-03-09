@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, useMemo, type ReactNode } from "react";
-import { fetchAll, type AllDataResponse } from "@/api/client";
+import { fetchAll, getApiBase, type AllDataResponse } from "@/api/client";
 import {
   schools as defaultSchools,
   classes as defaultClasses,
@@ -130,7 +130,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [apiData, setApiData] = useState<AllDataResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const apiUrl = typeof import.meta.env !== "undefined" ? import.meta.env.VITE_API_URL : "";
+  const apiUrl = getApiBase();
 
   const load = useMemo(
     () => () => {
