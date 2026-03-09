@@ -1,4 +1,9 @@
-# Database scripts – run order
+# Database scripts
+
+- **railway_core_schema.sql** – Run this **first** on an empty Railway (or fresh) MySQL database. It creates all core tables and seed data for login. See **RAILWAY_SETUP.md** for details.
+- **DATABASE_REQUIREMENTS.md** – What data the app reads and what to insert for each feature.
+
+## Run order (if adding scripts individually)
 
 1. **schools-table.sql**  
    Creates the `schools` table (id, name, code, district, active_status, sessions_completed, created_at, updated_at). Use if you don’t have it yet.

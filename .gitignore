@@ -28,3 +28,18 @@ dist-ssr
 
 # Environment (do not commit secrets)
 .env
+
+# Python / AI model
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+*.pkl
+*.faiss
+.venv
+venv
+env
+
+# Generated or large binaries (regenerate with ai_model scripts)
+ai_model/chunks.pkl
+ai_model/syllabus_vectors.faiss
