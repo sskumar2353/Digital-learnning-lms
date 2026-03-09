@@ -3,23 +3,34 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-import faiss
-import numpy as np
-import pickle
 from fastapi import APIRouter
 from pydantic import BaseModel
-from transformers import pipeline
-
-from shared_embeddings import embedding_model
 
 _here = Path(__file__).resolve().parent
 
-print("[chatbot] Loading FAISS index...")
-index = faiss.read_index(str(_here / "syllabus_vectors.faiss"))
+# Optional RAG: load FAISS + chunks only if files exist (so server starts without them)
+index = None
+chunks = []
+try:
+    import faiss
+    import numpy as np
+    import pickle
+    _faiss_path = _here / "syllabus_vectors.faiss"
+    _chunks_path = _here / "chunks.pkl"
+    if _faiss_path.exists() and _chunks_path.exists():
+        print("[chatbot] Loading FAISS index...")
+        index = faiss.read_index(str(_faiss_path))
+        print("[chatbot] Loading syllabus chunks...")
+        with open(_chunks_path, "rb") as f:
+            chunks = pickle.load(f)
+        print("[chatbot] RAG ready.")
+    else:
+        print("[chatbot] RAG skipped: missing syllabus_vectors.faiss or chunks.pkl (add them for context-aware answers).")
+except Exception as e:
+    print(f"[chatbot] RAG load failed: {e!s[:120]}. Running without RAG.")
 
-print("[chatbot] Loading syllabus chunks...")
-with open(_here / "chunks.pkl", "rb") as f:
-    chunks = pickle.load(f)
+from shared_embeddings import embedding_model
+from transformers import pipeline
 
 print("[chatbot] Loading LLM...")
 # Default to a smaller, faster instruction-tuned model (better latency on CPU).
@@ -49,10 +60,13 @@ class Question(BaseModel):
 
 
 def retrieve_chunks(question: str, k: int = 5):
-    """Retrieve top-k relevant chunks for better context."""
+    """Retrieve top-k relevant chunks for better context. Returns [] if RAG not loaded."""
+    if index is None or not chunks:
+        return []
+    import numpy as np
     question_embedding = embedding_model.encode([question], show_progress_bar=False)
-    D, I = index.search(np.array(question_embedding).astype("float32"), k)
-    return [chunks[i] for i in I[0] if i < len(chunks)]
+    D, I = index.search(np.array(question_embedding).astype("float32"), min(k, len(chunks)))
+    return [chunks[i] for i in I[0] if 0 <= i < len(chunks)]
 
 
 def _dedupe_answer(text: str) -> str:

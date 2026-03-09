@@ -17,14 +17,14 @@ If you see **"Table 'railway.teachers' doesn't exist"** or the database is **com
 
 This creates all core tables (admins, schools, classes, teachers, subjects, students, chapters, topics, enrollments, teacher_assignments, teacher_leaves, etc.) and inserts a **demo admin**, **demo school**, **demo teacher**, and **demo class** so you can log in immediately.
 
-- **Admin login:** email `admin@lms.com` — any password (placeholder hash).
-- **Teacher login:** email `teacher@lms.com` — any password (placeholder hash).
+- **Admin login:** email `admin@lms.com` — password **`Password123`** (change after first login).
+- **Teacher login:** email `teacher@lms.com` — password **`Password123`** (change after first login).
 
 You can add more schools, teachers, and students from the app after logging in.
 
 ### If only one table is missing
 
-If most tables already exist and only e.g. `teacher_assignments` is missing, run just **`database/teacher_assignments-table.sql`** (requires `teachers`, `classes`, `subjects` to exist).
+If most tables already exist and one table is missing, run the relevant part of **`railway_core_schema.sql`** (e.g. the `CREATE TABLE IF NOT EXISTS` for that table) or run the full script again.
 
 ### Other tables the app uses
 

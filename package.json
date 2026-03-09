@@ -6,14 +6,18 @@
   "packageManager": "npm@10.2.5",
   "scripts": {
     "dev": "vite",
-    "server": "node server/index.js",
-    "start": "npm run build && node server/index.js",
+    "server": "node backend/server/index.js",
+    "start": "npm run build && node backend/server/index.js",
     "build": "vite build",
-    "build:dev": "vite build --mode development",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:unit": "vitest run --dir frontend/src",
+    "test:frontend": "vitest run",
+    "test:backend": "node --test backend/server/utils.test.js",
+    "test:all": "npm run test:backend && npm run test:frontend",
+    "test:ci": "npm run test:all"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",

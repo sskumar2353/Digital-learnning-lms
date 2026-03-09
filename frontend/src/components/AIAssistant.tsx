@@ -78,10 +78,12 @@ const AIAssistant = ({ isOpen, onClose, topicName, chapterName, initialQuestion 
       const aiText = data.answer ?? "Sorry, I couldn't generate a response.";
       setMessages(prev => [...prev, { role: "ai", text: aiText }]);
     } catch (error) {
-      setMessages(prev => [
-        ...prev,
-        { role: "ai", text: "Oops! Something went wrong connecting to the AI. Please check your connection and try again." },
-      ]);
+      const isOffline =
+        error instanceof TypeError && (error.message === "Failed to fetch" || error.message?.includes("fetch"));
+      const msg = isOffline
+        ? "The AI server isn't running. Start it in a separate terminal: cd backend/ai_model && python -m uvicorn api:app --reload --port 8000"
+        : "Oops! Something went wrong connecting to the AI. Please try again.";
+      setMessages(prev => [...prev, { role: "ai", text: msg }]);
     } finally {
       setIsLoading(false);
     }

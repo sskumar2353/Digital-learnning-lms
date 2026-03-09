@@ -1,11 +1,16 @@
-// Use VITE_API_URL if set; otherwise same origin (works when API is served from same host, e.g. Railway)
+// API base: VITE_API_URL or same origin; in dev on port 8080 defaults to http://localhost:3001.
 function resolveApiBase(): string {
   const fromEnv =
     typeof import.meta.env !== "undefined" && import.meta.env.VITE_API_URL
-      ? import.meta.env.VITE_API_URL
+      ? String(import.meta.env.VITE_API_URL).trim()
       : "";
-  if (fromEnv) return fromEnv;
-  if (typeof window !== "undefined" && window.location?.origin) return window.location.origin;
+  if (fromEnv) return fromEnv.replace(/\/$/, "");
+  if (typeof window !== "undefined" && window.location?.origin) {
+    const origin = window.location.origin;
+    const port = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
+    if (import.meta.env?.DEV && port === "8080") return "http://localhost:3001";
+    return origin;
+  }
   return "";
 }
 const API_BASE = resolveApiBase();
@@ -93,8 +98,9 @@ export interface AllDataResponse {
 }
 
 export async function fetchAll(): Promise<AllDataResponse> {
-  if (!API_BASE) throw new Error("VITE_API_URL is not set");
+  if (!API_BASE) throw new Error("API URL not set. In dev set VITE_API_URL (e.g. http://localhost:3001).");
   const res = await fetch(`${API_BASE}/api/all`);
+  if (res.status === 404) throw new Error("API not found. Ensure the backend is running and VITE_API_URL points to it.");
   if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
   return res.json() as Promise<AllDataResponse>;
 }
@@ -394,7 +400,7 @@ export async function updateTeacherAssignments(
   return res.json();
 }
 
-export async function adminLogin(body: { email: string; password?: string }): Promise<{ id: string; email: string; full_name: string; role: string }> {
+export async function adminLogin(body: { email: string; password: string }): Promise<{ id: string; email: string; full_name: string; role: string }> {
   if (!API_BASE) throw new Error("VITE_API_URL is not set");
   const res = await fetch(`${API_BASE}/api/auth/login`, {
     method: "POST",
@@ -405,9 +411,20 @@ export async function adminLogin(body: { email: string; password?: string }): Pr
   return res.json();
 }
 
-export async function teacherLogin(body: { email: string; password?: string }): Promise<{ id: string; email: string; full_name: string; school_id: string }> {
+export async function teacherLogin(body: { email: string; password: string }): Promise<{ id: string; email: string; full_name: string; school_id: string }> {
   if (!API_BASE) throw new Error("VITE_API_URL is not set");
   const res = await fetch(`${API_BASE}/api/auth/login/teacher`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await parseErrorResponse(res));
+  return res.json();
+}
+
+export async function studentLogin(body: { student_id: string; password: string }): Promise<{ id: string; full_name: string; school_id: string }> {
+  if (!API_BASE) throw new Error("VITE_API_URL is not set");
+  const res = await fetch(`${API_BASE}/api/auth/login/student`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

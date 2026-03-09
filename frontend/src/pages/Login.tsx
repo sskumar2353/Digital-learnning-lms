@@ -6,8 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { GraduationCap, ArrowLeft } from "lucide-react";
 import { Link } from "react-router-dom";
-import { students } from "@/data/demo-data";
-import { adminLogin, teacherLogin } from "@/api/client";
+import { adminLogin, teacherLogin, studentLogin } from "@/api/client";
 
 const Login = () => {
   const [searchParams] = useSearchParams();
@@ -15,31 +14,25 @@ const Login = () => {
   const role: "teacher" | "admin" | "student" = roleParam === "student" ? "student" : roleParam === "teacher" ? "teacher" : "admin";
 
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("demo123");
+  const [password, setPassword] = useState("");
   const navigate = useNavigate();
   const { login } = useAuth();
 
-  // optional: pre-fill only for demo/admin; teacher/student use DB credentials
   useEffect(() => {
-    if (role === "admin") {
-      setEmail("admin@demo.com");
-      setPassword("demo123");
-    } else if (role === "student") {
-      setEmail("st1");
-      setPassword("demo123");
-    } else {
-      setEmail("");
-      setPassword("");
-    }
+    setEmail("");
+    setPassword("");
   }, [role]);
-
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (role === "student") {
-      const student = students.find(s => s.id === email);
-      login("student", student?.name || "Student", email);
-      navigate("/student");
+      try {
+        const data = await studentLogin({ student_id: email.trim(), password });
+        login("student", data.full_name, data.id);
+        navigate("/student");
+      } catch (err) {
+        alert(err instanceof Error ? err.message : "Login failed");
+      }
     } else if (role === "admin") {
       try {
         const data = await adminLogin({ email: email.trim(), password });
@@ -78,7 +71,7 @@ const Login = () => {
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
               {role === "student"
-                ? "Enter your Student ID to continue"
+                ? "Sign in with your Student ID and password"
                 : role === "teacher"
                   ? "Sign in with your registered email and password"
                   : "Sign in with your admin email and password"}
@@ -94,26 +87,25 @@ const Login = () => {
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 className="mt-1"
-                placeholder={role === "student" ? "e.g. st1" : ""}
+                placeholder={role === "student" ? "e.g. 1" : ""}
+                required
               />
               {role === "student" && (
-                <p className="text-xs text-muted-foreground mt-1">Demo IDs: st1 to st10 (Class 8-A), st11 to st20 (Class 9-B)</p>
+                <p className="text-xs text-muted-foreground mt-1">Use the numeric ID given by your school.</p>
               )}
             </div>
             <div>
               <Label htmlFor="password">Password</Label>
-              <Input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} className="mt-1" />
+              <Input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} className="mt-1" required />
             </div>
 
             <Button type="submit" className="w-full" size="lg">
               Sign In as {roleLabels[role]}
             </Button>
           </form>
-          {role === "admin" && (
-            <p className="text-xs text-muted-foreground text-center mt-4">
-              Demo credentials may be pre-filled. Use your database credentials to sign in.
-            </p>
-          )}
+          <p className="text-xs text-muted-foreground text-center mt-4">
+            All roles require a password. Use the credentials set by your admin or during registration.
+          </p>
         </div>
       </div>
     </div>

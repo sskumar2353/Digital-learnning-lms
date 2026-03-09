@@ -1,3 +1,3 @@
 #!/bin/sh
 set -e
-exec node server/index.js
+exec node backend/server/index.js

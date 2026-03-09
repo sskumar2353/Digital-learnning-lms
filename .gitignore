@@ -40,6 +40,8 @@ __pycache__
 venv
 env
 
-# Generated or large binaries (regenerate with ai_model scripts)
-ai_model/chunks.pkl
-ai_model/syllabus_vectors.faiss
+# Generated or large binaries (regenerate with backend/ai_model scripts)
+**/ai_model/chunks.pkl
+**/ai_model/syllabus_vectors.faiss
+# Legacy root copy removed; use backend/ai_model only
+/ai_model

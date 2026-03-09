@@ -2,6 +2,16 @@
 
 An educational platform for managing student learning activities, quizzes, and progress tracking.
 
+## Project structure
+
+- **`frontend/`** – React (Vite) app: `src/`, `public/`, `index.html`. Build output: root `dist/`.
+- **`backend/`** – Backend services:
+  - **`backend/server/`** – Node.js (Express) API; serves the built frontend and handles auth, DB, uploads.
+  - **`backend/ai_model/`** – Python (FastAPI) AI: chatbot and recommendations. Run with `cd backend/ai_model && python -m uvicorn api:app --reload --port 8000`.
+- **`database/`** – SQL scripts and schema (e.g. `railway_core_schema.sql`).
+
+Config files (Vite, Tailwind, TypeScript, etc.) stay at the repository root; Vite is configured with `root: "frontend"`. The canonical AI code lives in `backend/ai_model` only.
+
 ## Project Overview
 
 Engage Learn Monitor is a comprehensive educational platform built with modern web technologies to facilitate interactive learning experiences.

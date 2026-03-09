@@ -266,12 +266,11 @@ CREATE TABLE IF NOT EXISTS live_sessions (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- =============================================================================
--- Seed: one admin, one school, one teacher so you can log in and add data from the app.
--- Placeholder password_hash: app treats it as "no password" so any password works for testing.
--- Change these later via the app or by updating the rows in the database.
+-- Seed: one admin, one school, one teacher. Default password for both: Password123
+-- (bcrypt hash below). Change password after first login.
 -- =============================================================================
 INSERT IGNORE INTO admins (id, email, full_name, role, password_hash) VALUES
-(1, 'admin@lms.com', 'Admin', 'admin', 'placeholder');
+(1, 'admin@lms.com', 'Admin', 'admin', '$2b$10$z8GfO68JFuM8/unTyNtL5eVS98YtehJ3BvYbWhXvBY2qT5JJW69fm');
 
 INSERT IGNORE INTO schools (id, name, code, district, mandal, active_status, sessions_completed) VALUES
 (1, 'Demo School', 'DEMO001', 'Demo District', NULL, 1, 0);
@@ -285,7 +284,7 @@ INSERT IGNORE INTO subjects (id, name, icon, grades) VALUES
 (3, 'Science', '🔬', '10');
 
 INSERT IGNORE INTO teachers (id, school_id, full_name, email, password_hash) VALUES
-(1, 1, 'Demo Teacher', 'teacher@lms.com', 'placeholder');
+(1, 1, 'Demo Teacher', 'teacher@lms.com', '$2b$10$z8GfO68JFuM8/unTyNtL5eVS98YtehJ3BvYbWhXvBY2qT5JJW69fm');
 
 INSERT IGNORE INTO teacher_assignments (teacher_id, class_id, subject_id) VALUES
 (1, 1, 1);

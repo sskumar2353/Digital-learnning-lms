@@ -9,11 +9,16 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 from fastapi import APIRouter
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from pydantic import BaseModel
 from sentence_transformers import util
 from typing import Optional
+
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+except ImportError:
+    build = None
+    HttpError = Exception  # fallback for type refs
 
 # Load .env first so YOUTUBE_API_KEY is available before any other imports that might use it
 _env_path = Path(__file__).resolve().parent / ".env"
@@ -32,11 +37,15 @@ _raw_yt_key = (os.environ.get("YOUTUBE_API_KEY") or "").strip()
 YOUTUBE_API_KEY = _raw_yt_key if _raw_yt_key and _raw_yt_key != "YOUR_YOUTUBE_API_KEY" else None
 from shared_embeddings import embedding_model
 
-youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY) if YOUTUBE_API_KEY else None
-if youtube:
-    print("[recommendations] YouTube client: OK (key loaded)")
-else:
-    print("[recommendations] YouTube client: NOT configured (set YOUTUBE_API_KEY in ai_model/.env)")
+youtube = None
+if YOUTUBE_API_KEY and build:
+    try:
+        youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+        print("[recommendations] YouTube client: OK (key loaded)")
+    except Exception as e:
+        print(f"[recommendations] YouTube client init failed: {e!s[:80]}")
+if not youtube:
+    print("[recommendations] YouTube: NOT configured (set YOUTUBE_API_KEY in backend/ai_model/.env)")
 
 
 class RecommendQuery(BaseModel):
@@ -76,7 +85,7 @@ def build_reco_query(topic: Optional[str], subject: Optional[str], grade: Option
 def search_youtube(query: str):
     """Use YouTube Data API v3 for real video results. Returns empty only on API error."""
     if not youtube:
-        print("[recommendations] YouTube skipped: no API key (set YOUTUBE_API_KEY in ai_model/.env and restart server)")
+        print("[recommendations] YouTube skipped: no API key (set YOUTUBE_API_KEY in backend/ai_model/.env)")
         return []
     search_query = f"{query} class 10 explanation"
     try:

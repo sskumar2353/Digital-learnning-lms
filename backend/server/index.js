@@ -9,6 +9,7 @@ import { execFile, exec } from "child_process";
 import { promisify } from "util";
 import QRCode from "qrcode";
 import archiver from "archiver";
+import { toId, isConnectionError } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -126,8 +127,6 @@ app.use("/uploads", (req, res, next) => {
 });
 app.use("/uploads", express.static(uploadsDir));
 
-const toId = (n) => (n != null ? String(n) : null);
-
 const QR_TYPES = ["A", "B", "C", "D"];
 
 async function generateStudentQRCodes(db, studentId) {
@@ -179,11 +178,6 @@ function getPool() {
   return pool;
 }
 
-function isConnectionError(err) {
-  const msg = err && (err.message || err.code || "");
-  return /ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET|connect/i.test(String(msg));
-}
-
 app.get("/api/health", (req, res) => {
   res.json({ ok: true });
 });
@@ -209,6 +203,9 @@ app.post("/api/auth/login", async (req, res) => {
   if (!email || !String(email).trim()) {
     return res.status(400).json({ error: "email is required" });
   }
+  if (!password || String(password).trim() === "") {
+    return res.status(400).json({ error: "password is required" });
+  }
   try {
     const [rows] = await db.query(
       "SELECT id, email, full_name, role, password_hash FROM admins WHERE email = ? LIMIT 1",
@@ -219,15 +216,15 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
     const hash = admin.password_hash && String(admin.password_hash).trim();
-    const isPlaceholderOrEmpty = !hash || hash === "" || /dummy|placeholder/i.test(hash);
-    if (!isPlaceholderOrEmpty) {
-      try {
-        const ok = await bcrypt.compare(String(password || ""), hash);
-        if (!ok) return res.status(401).json({ error: "Invalid email or password" });
-      } catch (err) {
-        console.error("bcrypt.compare error:", err.message);
-        return res.status(401).json({ error: "Invalid email or password" });
-      }
+    if (!hash || hash === "" || /dummy|placeholder/i.test(hash)) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    try {
+      const ok = await bcrypt.compare(String(password).trim(), hash);
+      if (!ok) return res.status(401).json({ error: "Invalid email or password" });
+    } catch (err) {
+      console.error("bcrypt.compare error:", err.message);
+      return res.status(401).json({ error: "Invalid email or password" });
     }
     res.json({
       id: String(admin.id),
@@ -250,6 +247,9 @@ app.post("/api/auth/login/teacher", async (req, res) => {
   if (!email || !String(email).trim()) {
     return res.status(400).json({ error: "Email is required" });
   }
+  if (!password || String(password).trim() === "") {
+    return res.status(400).json({ error: "password is required" });
+  }
   try {
     const [rows] = await db.query(
       "SELECT id, email, full_name, school_id, password_hash FROM teachers WHERE email = ? LIMIT 1",
@@ -260,10 +260,17 @@ app.post("/api/auth/login/teacher", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
     const hash = teacher.password_hash && String(teacher.password_hash).trim();
-    const isPlaceholderOrEmpty = !hash || hash === "" || /dummy|placeholder/i.test(hash);
-    if (!isPlaceholderOrEmpty) {
+    const isPlaceholder = !hash || hash === "" || /dummy|placeholder/i.test(hash);
+    if (isPlaceholder) {
+      // Legacy: teachers with $2a$10$dummy etc. can log in with default password (case-insensitive)
+      const defaultPassword = "Password123";
+      const given = String(password || "").trim();
+      if (given === "" || given.toLowerCase() !== defaultPassword.toLowerCase()) {
+        return res.status(401).json({ error: "Invalid email or password" });
+      }
+    } else {
       try {
-        const ok = await bcrypt.compare(String(password || ""), hash);
+        const ok = await bcrypt.compare(String(password).trim(), hash);
         if (!ok) return res.status(401).json({ error: "Invalid email or password" });
       } catch (err) {
         console.error("bcrypt.compare error (teacher):", err.message);
@@ -278,6 +285,54 @@ app.post("/api/auth/login/teacher", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /api/auth/login/teacher error:", err);
+    const message = isConnectionError(err)
+      ? "Database unavailable. Please try again later."
+      : (err && err.message) || "Login failed";
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post("/api/auth/login/student", async (req, res) => {
+  const db = getPool();
+  const { student_id, password } = req.body || {};
+  const sid = student_id != null ? String(student_id).trim() : "";
+  if (!sid) {
+    return res.status(400).json({ error: "Student ID is required" });
+  }
+  if (!password || String(password).trim() === "") {
+    return res.status(400).json({ error: "password is required" });
+  }
+  const numericId = parseInt(sid, 10);
+  if (Number.isNaN(numericId) || numericId < 1) {
+    return res.status(401).json({ error: "Invalid Student ID or password" });
+  }
+  try {
+    const [rows] = await db.query(
+      "SELECT id, full_name, school_id, password_hash FROM students WHERE id = ? LIMIT 1",
+      [numericId]
+    );
+    const student = Array.isArray(rows) && rows[0] ? rows[0] : null;
+    if (!student) {
+      return res.status(401).json({ error: "Invalid Student ID or password" });
+    }
+    const hash = student.password_hash && String(student.password_hash).trim();
+    if (!hash || hash === "" || /dummy|placeholder/i.test(hash)) {
+      return res.status(401).json({ error: "Invalid Student ID or password" });
+    }
+    try {
+      const ok = await bcrypt.compare(String(password).trim(), hash);
+      if (!ok) return res.status(401).json({ error: "Invalid Student ID or password" });
+    } catch (err) {
+      console.error("bcrypt.compare error (student):", err.message);
+      return res.status(401).json({ error: "Invalid Student ID or password" });
+    }
+    res.json({
+      id: String(student.id),
+      full_name: student.full_name || "Student",
+      school_id: String(student.school_id),
+    });
+  } catch (err) {
+    console.error("POST /api/auth/login/student error:", err);
     const message = isConnectionError(err)
       ? "Database unavailable. Please try again later."
       : (err && err.message) || "Login failed";
@@ -855,10 +910,10 @@ app.post("/api/students", async (req, res) => {
   if (!full_name || !school_id) {
     return res.status(400).json({ error: "full_name and school_id are required" });
   }
-  let passwordHash = null;
-  if (password && String(password).trim()) {
-    passwordHash = await bcrypt.hash(String(password).trim(), 10);
+  if (!password || String(password).trim() === "") {
+    return res.status(400).json({ error: "password is required for student login" });
   }
+  const passwordHash = await bcrypt.hash(String(password).trim(), 10);
   try {
     const [insertResult] = await db.query(
       "INSERT INTO students (full_name, roll_no, section, school_id, password_hash) VALUES (?, ?, ?, ?, ?)",
@@ -889,11 +944,11 @@ app.post("/api/teachers", async (req, res) => {
   if (!full_name || !school_id || !email) {
     return res.status(400).json({ error: "full_name, email and school_id are required" });
   }
-  const emailVal = String(email).trim();
-  let passwordHash = null;
-  if (password && String(password).trim()) {
-    passwordHash = await bcrypt.hash(String(password).trim(), 10);
+  if (!password || String(password).trim() === "") {
+    return res.status(400).json({ error: "password is required for teacher login" });
   }
+  const emailVal = String(email).trim();
+  const passwordHash = await bcrypt.hash(String(password).trim(), 10);
   try {
     const [insertResult] = await db.query(
       "INSERT INTO teachers (full_name, email, school_id, password_hash) VALUES (?, ?, ?, ?)",
@@ -1678,6 +1733,12 @@ app.put("/api/topics/:id/ppt", async (req, res) => {
     console.error("PUT /api/topics/:id/ppt error:", err);
     res.status(500).json({ error: String(err.message) });
   }
+});
+
+// Unknown /api routes → JSON 404
+app.use("/api", (req, res, next) => {
+  if (res.headersSent) return next();
+  res.status(404).json({ error: "Not found", path: req.path });
 });
 
 // Serve built frontend (Vite build output) in production

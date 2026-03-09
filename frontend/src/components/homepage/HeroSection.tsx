@@ -2,7 +2,8 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { ArrowRight, Sparkles, Brain, BarChart3, Video, BookOpen } from "lucide-react";
 import { motion } from "framer-motion";
-import heroDashboard from "@/assets/hero-dashboard.jpg";
+
+const heroImage = "/placeholder.svg";
 
 const HeroSection = () => {
   const aiFeatures = [
@@ -81,7 +82,7 @@ const HeroSection = () => {
           >
             <div className="rounded-2xl overflow-hidden shadow-hover border border-border">
               <img
-                src={heroDashboard}
+                src={heroImage}
                 alt="AI Classroom Dashboard Preview"
                 className="w-full h-auto"
               />

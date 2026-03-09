@@ -55,6 +55,10 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
       setError("Please select a class (grade 6–10).");
       return;
     }
+    if (!password.trim()) {
+      setError("Password is required for student login.");
+      return;
+    }
     setSubmitting(true);
     try {
       await registerStudent({
@@ -63,7 +67,7 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
         section: section.trim(),
         school_id: schoolId.trim(),
         class_id: finalClassId ?? undefined,
-        password: password.trim() || undefined,
+        password: password.trim(),
       });
       onSuccess?.();
       onClose?.();
@@ -117,8 +121,8 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
             </div>
           </div>
           <div className="space-y-2">
-            <Label>Password (optional)</Label>
-            <Input type="password" placeholder="Leave blank if not needed" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+            <Label>Password (required for login)</Label>
+            <Input type="password" placeholder="Enter password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="new-password" />
           </div>
           <div className="space-y-2">
             <Label>Class (required, grades 6–10)</Label>

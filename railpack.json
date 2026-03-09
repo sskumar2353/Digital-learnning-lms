@@ -7,6 +7,6 @@
     "command": "npm run build"
   },
   "deploy": {
-    "startCommand": "node server/index.js"
+    "startCommand": "node backend/server/index.js"
   }
 }
