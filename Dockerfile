@@ -21,8 +21,10 @@ RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
 COPY server ./server
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
 
 ENV NODE_ENV=production
 EXPOSE 3001
 
-CMD ["node", "server/index.js"]
+ENTRYPOINT ["/docker-entrypoint.sh"]
