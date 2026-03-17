@@ -1,0 +1,13 @@
+# Render Blueprint: one Web Service (Node) – API + built frontend
+# Add MYSQL_*, GROQ_API_KEY in Render Dashboard → Environment
+services:
+  - type: web
+    name: digital-learning
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run server
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
