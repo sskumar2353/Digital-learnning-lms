@@ -15,7 +15,7 @@
 | **Region** | Oregon (or nearest) |
 | **Runtime** | Node |
 | **Build Command** | `npm install && npm run build` |
-| **Start Command** | `npm run server` |
+| **Start Command** | `npm run server` or `npm start` (do **not** use `npm run build && ...` here; build runs in Build Command only) |
 | **Instance Type** | Free |
 
 ## 3. Environment variables
