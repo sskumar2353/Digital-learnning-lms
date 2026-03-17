@@ -1,4 +1,5 @@
-// API base: VITE_API_URL or same origin; in dev on port 8080 defaults to http://localhost:3001.
+// API base: VITE_API_URL or same origin; in dev (ports 8080, 8081, 5173) defaults to http://localhost:3001.
+const DEV_FRONTEND_PORTS = ["8080", "8081", "5173"];
 function resolveApiBase(): string {
   const fromEnv =
     typeof import.meta.env !== "undefined" && import.meta.env.VITE_API_URL
@@ -6,10 +7,9 @@ function resolveApiBase(): string {
       : "";
   if (fromEnv) return fromEnv.replace(/\/$/, "");
   if (typeof window !== "undefined" && window.location?.origin) {
-    const origin = window.location.origin;
     const port = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
-    if (import.meta.env?.DEV && port === "8080") return "http://localhost:3001";
-    return origin;
+    if (import.meta.env?.DEV && DEV_FRONTEND_PORTS.includes(port)) return "http://localhost:3001";
+    return window.location.origin;
   }
   return "";
 }

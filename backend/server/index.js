@@ -129,6 +129,15 @@ app.use("/uploads", express.static(uploadsDir));
 
 const QR_TYPES = ["A", "B", "C", "D"];
 
+// Admin emails allowed for login without DB (plain-text password check: passadmin123)
+const STATIC_ADMINS = [
+  { email: "admin1@aliet.com", full_name: "Admin 1" },
+  { email: "admin2@ghs.com", full_name: "Admin 2" },
+  { email: "admin3@zphs.com", full_name: "Admin 3" },
+  { email: "admin4@modelschool.com", full_name: "Admin 4" },
+  { email: "admin5@residential.com", full_name: "Admin 5" },
+];
+
 async function generateStudentQRCodes(db, studentId) {
   const sid = Number(studentId);
   if (!sid) return [];
@@ -198,32 +207,43 @@ app.get("/api/db-check", async (req, res) => {
 });
 
 app.post("/api/auth/login", async (req, res) => {
-  const db = getPool();
-  const { email, password } = req.body || {};
-  if (!email || !String(email).trim()) {
+  const emailTrim = req.body?.email != null ? String(req.body.email).trim() : "";
+  const { password } = req.body || {};
+  if (!emailTrim) {
     return res.status(400).json({ error: "email is required" });
   }
   if (!password || String(password).trim() === "") {
     return res.status(400).json({ error: "password is required" });
   }
+  const givenPassword = String(password).trim();
+
+  // Static admins (no DB row): plain-text password must be exactly passadmin123
+  const staticAdmin = STATIC_ADMINS.find((a) => a.email.toLowerCase() === emailTrim.toLowerCase());
+  if (staticAdmin) {
+    if (givenPassword !== "passadmin123") {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    return res.json({
+      id: "admin-" + staticAdmin.email.replace(/@.*/, ""),
+      email: staticAdmin.email,
+      full_name: staticAdmin.full_name || staticAdmin.email,
+      role: "admin",
+    });
+  }
+
+  // DB-backed admins: compare plain-text password with what is stored in password_hash
   try {
+    const db = getPool();
     const [rows] = await db.query(
       "SELECT id, email, full_name, role, password_hash FROM admins WHERE email = ? LIMIT 1",
-      [String(email).trim()]
+      [emailTrim]
     );
     const admin = Array.isArray(rows) && rows[0] ? rows[0] : null;
     if (!admin) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
-    const hash = admin.password_hash && String(admin.password_hash).trim();
-    if (!hash || hash === "" || /dummy|placeholder/i.test(hash)) {
-      return res.status(401).json({ error: "Invalid email or password" });
-    }
-    try {
-      const ok = await bcrypt.compare(String(password).trim(), hash);
-      if (!ok) return res.status(401).json({ error: "Invalid email or password" });
-    } catch (err) {
-      console.error("bcrypt.compare error:", err.message);
+    const stored = admin.password_hash != null ? String(admin.password_hash).trim() : "";
+    if (!stored || givenPassword !== stored) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
     res.json({
@@ -259,23 +279,11 @@ app.post("/api/auth/login/teacher", async (req, res) => {
     if (!teacher) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
-    const hash = teacher.password_hash && String(teacher.password_hash).trim();
-    const isPlaceholder = !hash || hash === "" || /dummy|placeholder/i.test(hash);
-    if (isPlaceholder) {
-      // Legacy: teachers with $2a$10$dummy etc. can log in with default password (case-insensitive)
-      const defaultPassword = "Password123";
-      const given = String(password || "").trim();
-      if (given === "" || given.toLowerCase() !== defaultPassword.toLowerCase()) {
-        return res.status(401).json({ error: "Invalid email or password" });
-      }
-    } else {
-      try {
-        const ok = await bcrypt.compare(String(password).trim(), hash);
-        if (!ok) return res.status(401).json({ error: "Invalid email or password" });
-      } catch (err) {
-        console.error("bcrypt.compare error (teacher):", err.message);
-        return res.status(401).json({ error: "Invalid email or password" });
-      }
+    // Plain-text password check: compare input with stored password_hash
+    const given = String(password).trim();
+    const stored = teacher.password_hash != null ? String(teacher.password_hash).trim() : "";
+    if (!stored || given !== stored) {
+      return res.status(401).json({ error: "Invalid email or password" });
     }
     res.json({
       id: String(teacher.id),
@@ -315,15 +323,10 @@ app.post("/api/auth/login/student", async (req, res) => {
     if (!student) {
       return res.status(401).json({ error: "Invalid Student ID or password" });
     }
-    const hash = student.password_hash && String(student.password_hash).trim();
-    if (!hash || hash === "" || /dummy|placeholder/i.test(hash)) {
-      return res.status(401).json({ error: "Invalid Student ID or password" });
-    }
-    try {
-      const ok = await bcrypt.compare(String(password).trim(), hash);
-      if (!ok) return res.status(401).json({ error: "Invalid Student ID or password" });
-    } catch (err) {
-      console.error("bcrypt.compare error (student):", err.message);
+    // Plain-text password check: compare input with stored password_hash
+    const given = String(password).trim();
+    const stored = student.password_hash != null ? String(student.password_hash).trim() : "";
+    if (!stored || given !== stored) {
       return res.status(401).json({ error: "Invalid Student ID or password" });
     }
     res.json({
@@ -913,11 +916,11 @@ app.post("/api/students", async (req, res) => {
   if (!password || String(password).trim() === "") {
     return res.status(400).json({ error: "password is required for student login" });
   }
-  const passwordHash = await bcrypt.hash(String(password).trim(), 10);
+  const passwordPlain = String(password).trim();
   try {
     const [insertResult] = await db.query(
       "INSERT INTO students (full_name, roll_no, section, school_id, password_hash) VALUES (?, ?, ?, ?, ?)",
-      [String(full_name).trim(), roll_no != null ? Number(roll_no) : 0, section ? String(section).trim() : null, Number(school_id), passwordHash]
+      [String(full_name).trim(), roll_no != null ? Number(roll_no) : 0, section ? String(section).trim() : null, Number(school_id), passwordPlain]
     );
     const studentId = insertResult.insertId;
     if (class_id && studentId) {
@@ -948,11 +951,11 @@ app.post("/api/teachers", async (req, res) => {
     return res.status(400).json({ error: "password is required for teacher login" });
   }
   const emailVal = String(email).trim();
-  const passwordHash = await bcrypt.hash(String(password).trim(), 10);
+  const passwordPlain = String(password).trim();
   try {
     const [insertResult] = await db.query(
       "INSERT INTO teachers (full_name, email, school_id, password_hash) VALUES (?, ?, ?, ?)",
-      [String(full_name).trim(), emailVal, Number(school_id), passwordHash]
+      [String(full_name).trim(), emailVal, Number(school_id), passwordPlain]
     );
     const teacherId = insertResult.insertId;
     res.status(201).json({ id: String(teacherId), full_name: String(full_name).trim(), email: emailVal, school_id: String(school_id) });
@@ -974,9 +977,9 @@ app.put("/api/teachers/:id", async (req, res) => {
     if (email !== undefined) { updates.push("email = ?"); values.push(String(email).trim()); }
     if (school_id !== undefined) { updates.push("school_id = ?"); values.push(Number(school_id)); }
     if (password !== undefined) {
-      const hash = password && String(password).trim() ? await bcrypt.hash(String(password).trim(), 10) : null;
+      const plain = password && String(password).trim() ? String(password).trim() : null;
       updates.push("password_hash = ?");
-      values.push(hash);
+      values.push(plain);
     }
     if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
     values.push(id);
@@ -1070,9 +1073,9 @@ app.put("/api/students/:id", async (req, res) => {
     if (section !== undefined) { updates.push("section = ?"); values.push(section ? String(section).trim() : null); }
     if (school_id !== undefined) { updates.push("school_id = ?"); values.push(Number(school_id)); }
     if (password !== undefined) {
-      const hash = password && String(password).trim() ? await bcrypt.hash(String(password).trim(), 10) : null;
+      const plain = password && String(password).trim() ? String(password).trim() : null;
       updates.push("password_hash = ?");
-      values.push(hash);
+      values.push(plain);
     }
     if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
     values.push(id);
@@ -1320,6 +1323,40 @@ app.post("/api/topic-recommendations", async (req, res) => {
 
 // ---------- Live quiz (AI-generated MCQs; student answers; leaderboard; result analysis) ----------
 const AI_API_BASE = process.env.AI_API_BASE || "http://localhost:8000";
+const QUIZ_API_URL = (process.env.QUIZ_API_URL || "https://quiz-1-qo31.onrender.com").replace(/\/$/, "");
+
+const QUIZ_FETCH_TIMEOUT_MS = 8000; // fail fast so UI doesn't hang 30+ seconds
+
+async function fetchQuizQuestions(topicName, subjectName, grade = 10) {
+  const body = { topic_name: topicName, subject: subjectName, grade };
+  const opts = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const fetchWithTimeout = (url) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), QUIZ_FETCH_TIMEOUT_MS);
+    return fetch(url, { ...opts, signal: ctrl.signal })
+      .then((r) => { clearTimeout(t); return r; })
+      .catch((e) => { clearTimeout(t); throw e; });
+  };
+  try {
+    const resLocal = await fetchWithTimeout(`${AI_API_BASE}/generate_quiz`);
+    const dataLocal = resLocal && resLocal.ok ? await resLocal.json() : null;
+    if (dataLocal && Array.isArray(dataLocal.questions) && dataLocal.questions.length > 0) {
+      return dataLocal.questions;
+    }
+  } catch (_) {
+    // local AI not available or timeout, try external quiz API
+  }
+  try {
+    const resExternal = await fetchWithTimeout(`${QUIZ_API_URL}/generate_quiz`);
+    const dataExternal = resExternal && resExternal.ok ? await resExternal.json() : null;
+    if (dataExternal && Array.isArray(dataExternal.questions) && dataExternal.questions.length > 0) {
+      return dataExternal.questions;
+    }
+  } catch (_) {
+    // external quiz API not available or timeout
+  }
+  return [];
+}
 
 app.post("/api/live-quiz", async (req, res) => {
   const db = getPool();
@@ -1370,18 +1407,7 @@ app.post("/api/live-quiz", async (req, res) => {
 
     const subjectRow = await db.query("SELECT name FROM subjects WHERE id = ?", [Number(subjectId)]).then(([r]) => r && r[0]).catch(() => null);
     const subjectName = subjectRow ? subjectRow.name : "Subject";
-    let questions = [];
-    try {
-      const resAi = await fetch(`${AI_API_BASE}/generate_quiz`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic_name: topicName, subject: subjectName, grade: 10 }),
-      });
-      const data = resAi && resAi.ok ? await resAi.json() : { questions: [] };
-      questions = Array.isArray(data.questions) ? data.questions : [];
-    } catch (_) {
-      questions = [];
-    }
+    const questions = await fetchQuizQuestions(topicName, subjectName, 10);
     const numQuestionsToCreate = Math.max(questions.length, 1);
     let sessionId;
     if (liveSessionIdNum != null) {
@@ -1407,22 +1433,58 @@ app.post("/api/live-quiz", async (req, res) => {
     }
     for (let i = 0; i < numQuestionsToCreate; i++) {
       const q = questions[i] || {};
-      await db.query(
-        "INSERT INTO live_quiz_questions (live_quiz_session_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-          sessionId,
-          String(q.question_text || `Question ${i + 1}`).slice(0, 2000),
-          String(q.option_a || "A").slice(0, 512),
-          String(q.option_b || "B").slice(0, 512),
-          String(q.option_c || "C").slice(0, 512),
-          String(q.option_d || "D").slice(0, 512),
-          String(q.correct_option || "A").charAt(0).toUpperCase(),
-          String(q.explanation || "").slice(0, 1000),
-          i,
-        ]
-      );
+      try {
+        await db.query(
+          "INSERT INTO live_quiz_questions (live_quiz_session_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [
+            sessionId,
+            String(q.question_text || `Question ${i + 1}`).slice(0, 2000),
+            String(q.option_a || "A").slice(0, 512),
+            String(q.option_b || "B").slice(0, 512),
+            String(q.option_c || "C").slice(0, 512),
+            String(q.option_d || "D").slice(0, 512),
+            String(q.correct_option || "A").charAt(0).toUpperCase(),
+            String(q.explanation || "").slice(0, 1000),
+            i,
+          ]
+        );
+      } catch (insertErr) {
+        console.error("live_quiz_questions INSERT error:", insertErr.message);
+      }
     }
-    const [qRows] = await db.query("SELECT id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num FROM live_quiz_questions WHERE live_quiz_session_id = ? ORDER BY order_num", [sessionId]);
+    let qRows;
+    try {
+      const [rows] = await db.query("SELECT id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num FROM live_quiz_questions WHERE live_quiz_session_id = ? ORDER BY order_num", [sessionId]);
+      qRows = rows || [];
+    } catch (selectErr) {
+      console.error("live_quiz_questions SELECT error:", selectErr.message);
+      qRows = [];
+    }
+    const mappedQuestions = (qRows || []).map((q) => ({
+      id: String(q.id),
+      questionText: q.question_text,
+      optionA: q.option_a,
+      optionB: q.option_b,
+      optionC: q.option_c,
+      optionD: q.option_d,
+      correctOption: (q.correct_option || "A").toString().toUpperCase().charAt(0),
+      explanation: q.explanation || "",
+      orderNum: q.order_num,
+    }));
+    // Ensure we always return at least one question so the UI shows the quiz (e.g. if table missing or INSERT failed)
+    const questionsToReturn = mappedQuestions.length > 0
+      ? mappedQuestions
+      : [{
+          id: "placeholder-1",
+          questionText: `Quiz: ${topicName}. Add live_quiz_questions table if you see only this.`,
+          optionA: "Option A",
+          optionB: "Option B",
+          optionC: "Option C",
+          optionD: "Option D",
+          correctOption: "A",
+          explanation: "",
+          orderNum: 0,
+        }];
     res.status(201).json({
       id: String(sessionId),
       teacherId: String(teacherId),
@@ -1431,17 +1493,7 @@ app.post("/api/live-quiz", async (req, res) => {
       topicName: String(topicName),
       subjectId: String(subjectId),
       status: "active",
-      questions: (qRows || []).map((q) => ({
-        id: String(q.id),
-        questionText: q.question_text,
-        optionA: q.option_a,
-        optionB: q.option_b,
-        optionC: q.option_c,
-        optionD: q.option_d,
-        correctOption: (q.correct_option || "A").toString().toUpperCase().charAt(0),
-        explanation: q.explanation || "",
-        orderNum: q.order_num,
-      })),
+      questions: questionsToReturn,
     });
   } catch (err) {
     console.error("POST /api/live-quiz error:", err);
@@ -1457,7 +1509,30 @@ app.get("/api/live-quiz/:id", async (req, res) => {
     const [sRows] = await db.query("SELECT * FROM live_quiz_sessions WHERE id = ?", [sessionId]);
     if (!sRows || sRows.length === 0) return res.status(404).json({ error: "Session not found" });
     const s = sRows[0];
-    const [qRows] = await db.query("SELECT id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num FROM live_quiz_questions WHERE live_quiz_session_id = ? ORDER BY order_num", [sessionId]);
+    let qRows = [];
+    try {
+      const [rows] = await db.query("SELECT id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num FROM live_quiz_questions WHERE live_quiz_session_id = ? ORDER BY order_num", [sessionId]);
+      qRows = rows || [];
+    } catch (_) {
+      qRows = [];
+    }
+    const mapped = (qRows || []).map((q) => ({
+      id: String(q.id),
+      questionText: q.question_text,
+      optionA: q.option_a,
+      optionB: q.option_b,
+      optionC: q.option_c,
+      optionD: q.option_d,
+      correctOption: (q.correct_option || "A").toString().toUpperCase().charAt(0),
+      explanation: q.explanation || "",
+      orderNum: q.order_num,
+    }));
+    const questions = mapped.length > 0 ? mapped : [{
+      id: "placeholder-1",
+      questionText: `Quiz: ${s.topic_name || "Topic"}. Questions will appear when the quiz service is set up.`,
+      optionA: "Option A", optionB: "Option B", optionC: "Option C", optionD: "Option D",
+      correctOption: "A", explanation: "", orderNum: 0,
+    }];
     res.json({
       id: String(s.id),
       teacherId: toId(s.teacher_id),
@@ -1468,17 +1543,7 @@ app.get("/api/live-quiz/:id", async (req, res) => {
       subjectId: toId(s.subject_id),
       status: s.status || "active",
       createdAt: s.created_at ? String(s.created_at) : null,
-      questions: (qRows || []).map((q) => ({
-        id: String(q.id),
-        questionText: q.question_text,
-        optionA: q.option_a,
-        optionB: q.option_b,
-        optionC: q.option_c,
-        optionD: q.option_d,
-        correctOption: (q.correct_option || "A").toString().toUpperCase().charAt(0),
-        explanation: q.explanation || "",
-        orderNum: q.order_num,
-      })),
+      questions,
     });
   } catch (err) {
     console.error("GET /api/live-quiz/:id error:", err);
@@ -1493,10 +1558,13 @@ app.post("/api/live-quiz/:id/answer", async (req, res) => {
   if (!sessionId || !studentId || !questionId || selectedOption == null) {
     return res.status(400).json({ error: "studentId, questionId, selectedOption are required" });
   }
+  const opt = String(selectedOption).toUpperCase().charAt(0);
+  if (String(questionId) === "placeholder-1") {
+    return res.json({ ok: true, isCorrect: opt === "A" });
+  }
   try {
     const [qRow] = await db.query("SELECT correct_option FROM live_quiz_questions WHERE id = ? AND live_quiz_session_id = ?", [Number(questionId), sessionId]);
     const correctOption = qRow && qRow[0] ? String(qRow[0].correct_option || "A").toUpperCase().charAt(0) : "A";
-    const opt = String(selectedOption).toUpperCase().charAt(0);
     const isCorrect = opt === correctOption ? 1 : 0;
     await db.query(
       "INSERT INTO live_quiz_answers (live_quiz_session_id, student_id, question_id, selected_option, is_correct) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE selected_option = VALUES(selected_option), is_correct = VALUES(is_correct)",
@@ -1732,6 +1800,56 @@ app.put("/api/topics/:id/ppt", async (req, res) => {
   } catch (err) {
     console.error("PUT /api/topics/:id/ppt error:", err);
     res.status(500).json({ error: String(err.message) });
+  }
+});
+
+// ---------- AI Chatbot via GROQ (key from env; do not commit real key) ----------
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
+
+app.post("/api/chat/ask", async (req, res) => {
+  const { question } = req.body || {};
+  const q = (question && String(question).trim()) || "";
+  if (!q) {
+    return res.status(400).json({ question: "", answer: "Please ask a question." });
+  }
+  if (!GROQ_API_KEY) {
+    return res.status(503).json({
+      question: q,
+      answer: "GROQ API is not configured. Set GROQ_API_KEY in the server .env file.",
+    });
+  }
+  try {
+    const groqRes = await fetch(GROQ_CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        messages: [{ role: "user", content: q }],
+        max_tokens: 1024,
+        temperature: 0.3,
+      }),
+    });
+    if (!groqRes.ok) {
+      const errText = await groqRes.text();
+      console.error("GROQ API error:", groqRes.status, errText?.slice(0, 200));
+      return res.status(502).json({
+        question: q,
+        answer: "The AI service returned an error. Please try again or check GROQ_API_KEY.",
+      });
+    }
+    const data = await groqRes.json();
+    const answer = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+    res.json({ question: q, answer: answer.trim() || "No response from the model." });
+  } catch (err) {
+    console.error("POST /api/chat/ask error:", err.message);
+    res.status(500).json({
+      question: q,
+      answer: "Failed to reach the AI. Please try again.",
+    });
   }
 });
 

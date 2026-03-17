@@ -163,6 +163,7 @@ const TeacherDashboard = () => {
   const [liveQuizSession, setLiveQuizSession] = useState<{ id: string; questions: Array<{ id: string; questionText: string; optionA: string; optionB: string; optionC: string; optionD: string; correctOption: string; explanation: string }> } | null>(null);
   const [liveQuizLeaderboard, setLiveQuizLeaderboard] = useState<Array<{ rank: number; studentId: string; studentName: string; score: number }>>([]);
   const [liveQuizLaunching, setLiveQuizLaunching] = useState(false);
+  const [showLaunchQuizDialog, setShowLaunchQuizDialog] = useState(false);
   const liveQuizLeaderboardRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [sessionStartLoading, setSessionStartLoading] = useState(false);
   const [attendanceSubmitting, setAttendanceSubmitting] = useState(false);
@@ -383,35 +384,14 @@ const TeacherDashboard = () => {
   const openYoutubeRecos = useCallback(() => setShowYoutubePanel(true), []);
   const openEResourcesRecos = useCallback(() => setShowEResourcesPanel(true), []);
 
-  const handleLaunchLiveQuiz = useCallback(async () => {
-    if (!activeSession || !teacherId) return;
-    setLiveQuizLaunching(true);
-    try {
-      const result = await createLiveQuiz({
-        teacherId,
-        classId: activeSession.classId,
-        chapterId: activeSession.chapterId,
-        topicId: activeSession.topicId,
-        topicName: activeSession.topicName,
-        subjectId: activeSession.subjectId,
-        liveSessionId: activeSession.id,
-      });
-      setLiveQuizSession({ id: result.id, questions: result.questions || [] });
-      setSessionQuizDone(true);
-      liveQuizLeaderboardRef.current = setInterval(async () => {
-        try {
-          const lb = await getLiveQuizLeaderboard(result.id);
-          setLiveQuizLeaderboard(lb.leaderboard || []);
-        } catch (_) {}
-      }, 3000);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error("Launch Quiz failed:", e);
-      toast.error("Launch Quiz failed: " + (msg || "Check that the Node server and AI server (port 8000) are running."));
-    } finally {
-      setLiveQuizLaunching(false);
+  const handleLaunchLiveQuiz = useCallback(() => {
+    if (!activeSession) {
+      toast.error("Start a live teaching session before launching a quiz.");
+      return;
     }
-  }, [activeSession, teacherId]);
+    setSessionQuizDone(true);
+    setShowLaunchQuizDialog(true);
+  }, [activeSession]);
 
   const handleEndLiveQuiz = useCallback(async () => {
     if (!liveQuizSession) return;
@@ -733,7 +713,7 @@ const TeacherDashboard = () => {
             </Card>
           </div>
 
-          {/* Live quiz modal/section */}
+          {/* Live quiz (in-app session card; kept for any legacy use) */}
           {liveQuizSession && (
             <Card className="shadow-card border-border col-span-full">
               <CardHeader className="pb-2 flex flex-row items-center justify-between">
@@ -788,7 +768,7 @@ const TeacherDashboard = () => {
                   <button
                     key={i}
                     className="w-full flex items-center gap-3 p-2.5 rounded-lg hover:bg-secondary transition-colors text-left disabled:opacity-50 disabled:pointer-events-none"
-                    disabled={tool.label === "Launch Quiz" && liveQuizLaunching}
+                    disabled={false}
                     onClick={() => {
                       if (tool.label === "AI Chatbot") setAiOpen(true);
                       if (tool.label === "YouTube Recommendations") openYoutubeRecos();
@@ -878,6 +858,31 @@ const TeacherDashboard = () => {
             )}
           </div>
         </div>
+
+        {/* Launch Quiz — external quiz app in dialog; chapter & topic pre-filled via URL params */}
+        <Dialog open={showLaunchQuizDialog} onOpenChange={setShowLaunchQuizDialog}>
+          <DialogContent className="max-w-4xl max-h-[90vh] flex flex-col gap-4" aria-describedby={undefined}>
+            <DialogHeader className="flex-shrink-0">
+              <DialogTitle className="font-display">Live Quiz – Teacher Quiz</DialogTitle>
+              <DialogDescription id="quiz-dialog-desc">
+                Chapter and topic from your current session are passed to the quiz page. If they are not pre-filled, enter them and click Generate quiz. When you are done, close this dialog.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex-1 min-h-0 flex flex-col gap-3">
+              <iframe
+                title="Teacher Quiz – Live QR Scan"
+                src={`https://quiz-1-qo31.onrender.com?chapter=${encodeURIComponent(sessionChapter?.name || activeSession?.topicName || "")}&topic=${encodeURIComponent(activeSession?.topicName || "")}`}
+                className="w-full flex-1 min-h-[480px] rounded-lg border border-border bg-muted/30"
+                allow="camera"
+              />
+              <div className="flex justify-end gap-2 flex-shrink-0">
+                <Button variant="outline" onClick={() => setShowLaunchQuizDialog(false)}>
+                  Quiz ended? Close dialog
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
 
         {/* Lesson Plan Viewer — ongoing chapter only */}
         <Dialog open={lessonPlanOpen} onOpenChange={setLessonPlanOpen}>

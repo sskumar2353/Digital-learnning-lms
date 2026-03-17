@@ -2,8 +2,12 @@ import { useState, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Bot, Send, X } from "lucide-react";
+import { getApiBase } from "@/api/client";
 
-const AI_API_BASE = (typeof import.meta.env !== "undefined" && import.meta.env.VITE_AI_API_URL) || "http://localhost:8000";
+/** AI chatbot uses GROQ via our backend /api/chat/ask (API key on server only). */
+function getChatApiBase(): string {
+  return getApiBase();
+}
 
 interface AIAssistantProps {
   isOpen: boolean;
@@ -60,7 +64,7 @@ const AIAssistant = ({ isOpen, onClose, topicName, chapterName, initialQuestion 
         content: msg.text,
       }));
 
-      const response = await fetch(`${AI_API_BASE}/ask`, {
+      const response = await fetch(`${getChatApiBase()}/api/chat/ask`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -81,7 +85,7 @@ const AIAssistant = ({ isOpen, onClose, topicName, chapterName, initialQuestion 
       const isOffline =
         error instanceof TypeError && (error.message === "Failed to fetch" || error.message?.includes("fetch"));
       const msg = isOffline
-        ? "The AI server isn't running. Start it in a separate terminal: cd backend/ai_model && python -m uvicorn api:app --reload --port 8000"
+        ? "Cannot reach the app backend. Make sure the backend is running (npm run server) and GROQ_API_KEY is set in .env."
         : "Oops! Something went wrong connecting to the AI. Please try again.";
       setMessages(prev => [...prev, { role: "ai", text: msg }]);
     } finally {

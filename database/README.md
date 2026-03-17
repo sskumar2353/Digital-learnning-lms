@@ -1,6 +1,7 @@
 # Database scripts
 
 - **railway_core_schema.sql** – Run this **first** on an empty Railway (or fresh) MySQL database. It creates all core tables and seed data for login. See **RAILWAY_SETUP.md** for details.
+- **seed_teachers_credentials.sql** – Run after the core schema to add schools 2–5 and all teacher accounts (t1_s1@lms.com … t7_s5@lms.com, santhikumari@gmail.com, teacher@gmail.com). Login uses these emails; password verification is currently disabled in the backend.
 - **DATABASE_REQUIREMENTS.md** – What data the app reads and what to insert for each feature.
 
 ## Run order (if adding scripts individually)
