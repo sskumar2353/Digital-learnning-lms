@@ -215,14 +215,10 @@ app.post("/api/auth/login", async (req, res) => {
   if (!password || String(password).trim() === "") {
     return res.status(400).json({ error: "password is required" });
   }
-  const givenPassword = String(password).trim();
 
-  // Static admins (no DB row): plain-text password must be exactly passadmin123
+  // Static admins (no DB row): no password check
   const staticAdmin = STATIC_ADMINS.find((a) => a.email.toLowerCase() === emailTrim.toLowerCase());
   if (staticAdmin) {
-    if (givenPassword !== "passadmin123") {
-      return res.status(401).json({ error: "Invalid email or password" });
-    }
     return res.json({
       id: "admin-" + staticAdmin.email.replace(/@.*/, ""),
       email: staticAdmin.email,
@@ -231,7 +227,7 @@ app.post("/api/auth/login", async (req, res) => {
     });
   }
 
-  // DB-backed admins: compare plain-text password with what is stored in password_hash
+  // DB-backed admins: no password check, only require email to exist
   try {
     const db = getPool();
     const [rows] = await db.query(
@@ -240,10 +236,6 @@ app.post("/api/auth/login", async (req, res) => {
     );
     const admin = Array.isArray(rows) && rows[0] ? rows[0] : null;
     if (!admin) {
-      return res.status(401).json({ error: "Invalid email or password" });
-    }
-    const stored = admin.password_hash != null ? String(admin.password_hash).trim() : "";
-    if (!stored || givenPassword !== stored) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
     res.json({
@@ -279,12 +271,7 @@ app.post("/api/auth/login/teacher", async (req, res) => {
     if (!teacher) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
-    // Plain-text password check: compare input with stored password_hash
-    const given = String(password).trim();
-    const stored = teacher.password_hash != null ? String(teacher.password_hash).trim() : "";
-    if (!stored || given !== stored) {
-      return res.status(401).json({ error: "Invalid email or password" });
-    }
+    // No password check; only require teacher to exist
     res.json({
       id: String(teacher.id),
       email: teacher.email,
@@ -323,12 +310,7 @@ app.post("/api/auth/login/student", async (req, res) => {
     if (!student) {
       return res.status(401).json({ error: "Invalid Student ID or password" });
     }
-    // Plain-text password check: compare input with stored password_hash
-    const given = String(password).trim();
-    const stored = student.password_hash != null ? String(student.password_hash).trim() : "";
-    if (!stored || given !== stored) {
-      return res.status(401).json({ error: "Invalid Student ID or password" });
-    }
+    // No password check; only require student to exist
     res.json({
       id: String(student.id),
       full_name: student.full_name || "Student",
