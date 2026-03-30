@@ -27,23 +27,23 @@ try:
     else:
         print("[chatbot] RAG skipped: missing syllabus_vectors.faiss or chunks.pkl (add them for context-aware answers).")
 except Exception as e:
-    print(f"[chatbot] RAG load failed: {e!s[:120]}. Running without RAG.")
+    print(f"[chatbot] RAG load failed: {str(e)[:120]}. Running without RAG.")
 
 from shared_embeddings import embedding_model
 from transformers import pipeline
 
 print("[chatbot] Loading LLM...")
-# Default to a smaller, faster instruction-tuned model (better latency on CPU).
-# You can override with: set CHATBOT_MODEL=tiiuae/falcon-rw-1b
-_model_name = (os.environ.get("CHATBOT_MODEL") or "google/flan-t5-small").strip()
+# Keep defaults aligned with broadly supported pipeline tasks across environments.
+_model_name = (os.environ.get("CHATBOT_MODEL") or "distilgpt2").strip()
+_preferred_task = (os.environ.get("CHATBOT_TASK") or "text-generation").strip()
 llm = None
 llm_task = None
 try:
-    llm_task = "text2text-generation"
+    llm_task = _preferred_task
     llm = pipeline(llm_task, model=_model_name)
 except Exception as e:
-    print(f"[chatbot] text2text load failed: {str(e)[:160]}")
-    # Fallback to a tiny causal LM (fast + universally supported)
+    print(f"[chatbot] primary model load failed: {str(e)[:160]}")
+    # Fallback to a tiny causal LM (fast + universally supported).
     try:
         llm_task = "text-generation"
         fallback_model = (os.environ.get("CHATBOT_FALLBACK_MODEL") or "distilgpt2").strip()

@@ -26,6 +26,20 @@ import {
   studentUsageLogs as defaultStudentUsageLogs,
 } from "@/data/demo-data";
 
+const SUBJECT_ORDER = ["Telugu", "Hindi", "English", "Mathematics", "Physics", "Biology", "Social Studies"] as const;
+
+function sortSubjects<T extends { name?: string | null }>(subjects: T[]): T[] {
+  const rank = new Map(SUBJECT_ORDER.map((name, index) => [name, index]));
+  return [...subjects].sort((a, b) => {
+    const aName = (a.name || "").trim();
+    const bName = (b.name || "").trim();
+    const aRank = rank.has(aName) ? (rank.get(aName) as number) : Number.MAX_SAFE_INTEGER;
+    const bRank = rank.has(bName) ? (rank.get(bName) as number) : Number.MAX_SAFE_INTEGER;
+    if (aRank !== bRank) return aRank - bRank;
+    return aName.localeCompare(bName);
+  });
+}
+
 const emptyData: AllDataResponse = {
   schools: [],
   classes: [],
@@ -54,6 +68,8 @@ const emptyData: AllDataResponse = {
   topicRecommendations: [],
   liveQuizSessions: [],
   liveQuizAnswers: [],
+  timetables: [],
+  coCurricularActivities: [],
 };
 
 function toAppData(api: AllDataResponse | null): AllDataResponse {
@@ -63,7 +79,7 @@ function toAppData(api: AllDataResponse | null): AllDataResponse {
     classes: api.classes ?? emptyData.classes,
     teachers: api.teachers ?? emptyData.teachers,
     students: api.students ?? emptyData.students,
-    subjects: api.subjects ?? emptyData.subjects,
+    subjects: sortSubjects(api.subjects ?? emptyData.subjects),
     chapters: api.chapters ?? emptyData.chapters,
     topics: api.topics ?? emptyData.topics,
     studentQuizResults: api.studentQuizResults ?? emptyData.studentQuizResults,
@@ -86,6 +102,8 @@ function toAppData(api: AllDataResponse | null): AllDataResponse {
     topicRecommendations: api.topicRecommendations ?? emptyData.topicRecommendations,
     liveQuizSessions: api.liveQuizSessions ?? emptyData.liveQuizSessions,
     liveQuizAnswers: api.liveQuizAnswers ?? emptyData.liveQuizAnswers,
+    timetables: api.timetables ?? emptyData.timetables,
+    coCurricularActivities: api.coCurricularActivities ?? emptyData.coCurricularActivities,
   };
 }
 

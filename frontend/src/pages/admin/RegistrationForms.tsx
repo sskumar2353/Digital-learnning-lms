@@ -19,19 +19,17 @@ type StudentFormProps = {
 export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [], classes = [], onSuccess }) => {
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
-  const [rollNo, setRollNo] = useState("");
   const [section, setSection] = useState("");
   const [password, setPassword] = useState("");
   const [schoolId, setSchoolId] = useState("");
-  const [classId, setClassId] = useState("");
+  const [classGrade, setClassGrade] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const schoolList = schools ?? [];
   const classList = classes ?? [];
-  const classesForSchool = schoolId
-    ? classList.filter((c) => c.schoolId === schoolId)
-    : classList;
+  const classesForSchool = schoolId ? classList.filter((c) => c.schoolId === schoolId) : classList;
+  const classGradesForSchool = Array.from(new Set(classesForSchool.map((c) => String(c.grade)))).sort((a, b) => Number(a) - Number(b));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -41,17 +39,12 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
       setError("Please select a school.");
       return;
     }
-    const rollNum = rollNo.trim() !== "" ? parseInt(rollNo, 10) : undefined;
-    if (rollNum === undefined || Number.isNaN(rollNum) || rollNum < 0) {
-      setError("Roll number is required and must be a non-negative number.");
-      return;
-    }
     if (!section || (section !== "A" && section !== "B" && section !== "C")) {
       setError("Please select a section (A, B, or C).");
       return;
     }
-    const finalClassId = (classId?.trim() && classId !== "__none__") ? classId.trim() : null;
-    if (!finalClassId) {
+    const gradeNum = Number(classGrade);
+    if (!classGrade || Number.isNaN(gradeNum)) {
       setError("Please select a class (grade 6–10).");
       return;
     }
@@ -63,10 +56,9 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
     try {
       await registerStudent({
         full_name,
-        roll_no: rollNum,
         section: section.trim(),
         school_id: schoolId.trim(),
-        class_id: finalClassId ?? undefined,
+        grade_id: gradeNum,
         password: password.trim(),
       });
       onSuccess?.();
@@ -84,7 +76,7 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
         <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-4" autoComplete="off">
           <div className="space-y-2">
             <Label>School (required)</Label>
-            <Select value={schoolId} onValueChange={(v) => { setSchoolId(v); setClassId(""); }}>
+            <Select value={schoolId} onValueChange={(v) => { setSchoolId(v); setClassGrade(""); }}>
               <SelectTrigger className="h-9">
                 <SelectValue placeholder="Select school" />
               </SelectTrigger>
@@ -94,10 +86,6 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
                 ))}
               </SelectContent>
             </Select>
-          </div>
-          <div className="space-y-2">
-            <Label>Roll number (required)</Label>
-            <Input type="number" min={0} placeholder="e.g. 1" value={rollNo} onChange={(e) => setRollNo(e.target.value)} required />
           </div>
           <div className="space-y-2">
             <Label>Section (required)</Label>
@@ -125,15 +113,15 @@ export const StudentForm: React.FC<StudentFormProps> = ({ onClose, schools = [],
             <Input type="password" placeholder="Enter password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="new-password" />
           </div>
           <div className="space-y-2">
-            <Label>Class (required, grades 6–10)</Label>
-            <Select value={classId || "__none__"} onValueChange={(v) => setClassId(v === "__none__" ? "" : v)}>
+            <Label>Class (required)</Label>
+            <Select value={classGrade || "__none__"} onValueChange={(v) => setClassGrade(v === "__none__" ? "" : v)}>
               <SelectTrigger className="h-9">
                 <SelectValue placeholder="Select class" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="__none__">Select class</SelectItem>
-                {classesForSchool.map((c) => (
-                  <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>
+                {classGradesForSchool.map((g) => (
+                  <SelectItem key={g} value={g}>{`Class ${g}`}</SelectItem>
                 ))}
               </SelectContent>
             </Select>

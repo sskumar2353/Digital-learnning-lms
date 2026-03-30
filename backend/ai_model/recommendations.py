@@ -43,7 +43,7 @@ if YOUTUBE_API_KEY and build:
         youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
         print("[recommendations] YouTube client: OK (key loaded)")
     except Exception as e:
-        print(f"[recommendations] YouTube client init failed: {e!s[:80]}")
+        print(f"[recommendations] YouTube client init failed: {str(e)[:80]}")
 if not youtube:
     print("[recommendations] YouTube: NOT configured (set YOUTUBE_API_KEY in backend/ai_model/.env)")
 
@@ -85,8 +85,29 @@ def build_reco_query(topic: Optional[str], subject: Optional[str], grade: Option
 def search_youtube(query: str):
     """Use YouTube Data API v3 for real video results. Returns empty only on API error."""
     if not youtube:
-        print("[recommendations] YouTube skipped: no API key (set YOUTUBE_API_KEY in backend/ai_model/.env)")
-        return []
+        print("[recommendations] YouTube API key missing; using DDG YouTube fallback.")
+        videos = []
+        search_query = f"site:youtube.com/watch {query} class 10 explanation"
+        try:
+            import warnings
+            with warnings.catch_warnings(action="ignore"):
+                with DDGS() as ddgs:
+                    results = ddgs.text(search_query, max_results=12)
+            for r in results:
+                url = (r.get("href") or "").strip()
+                if not url.startswith("https://www.youtube.com/watch?v="):
+                    continue
+                title = (r.get("title") or "").strip()
+                if not title:
+                    continue
+                videos.append({
+                    "title": title,
+                    "description": (r.get("body") or "")[:500],
+                    "url": url,
+                })
+        except Exception as e:
+            print(f"[recommendations] DDG YouTube fallback error: {str(e)[:120]}")
+        return videos
     search_query = f"{query} class 10 explanation"
     try:
         request = youtube.search().list(

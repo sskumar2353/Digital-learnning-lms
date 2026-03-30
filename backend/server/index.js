@@ -5,11 +5,13 @@ import mysql from "mysql2/promise";
 import bcrypt from "bcrypt";
 import fs from "fs";
 import path from "path";
+import os from "os";
 import { execFile, exec } from "child_process";
 import { promisify } from "util";
 import QRCode from "qrcode";
 import archiver from "archiver";
 import { toId, isConnectionError } from "./utils.js";
+import * as assetStorage from "./storage.js";
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -98,36 +100,88 @@ async function convertPptToPdf(pptxPath) {
   return null;
 }
 
-// Serve /uploads/* — typo fix; on-demand PPT→PDF for viewing
-app.use("/uploads", (req, res, next) => {
+function contentTypeForUploadPath(subPath) {
+  const lower = String(subPath).toLowerCase();
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  if (lower.endsWith(".ppt")) return "application/vnd.ms-powerpoint";
+  return "application/octet-stream";
+}
+
+// Serve /uploads/* — local disk, S3 (AWS), typo fix; on-demand PPT→PDF for viewing
+app.use("/uploads", async (req, res, next) => {
   if (req.method !== "GET") return next();
   const subPath = (req.path || "").replace(/^\//, "");
   const requestedPath = path.join(uploadsDir, subPath);
-  if (fs.existsSync(requestedPath)) return next();
-  const typoPath = path.join(uploadsDir, subPath.replace(/Social_textbook_chunks/g, "Social_texbook_chunks"));
-  if (fs.existsSync(typoPath) && fs.statSync(typoPath).isFile()) {
-    return res.sendFile(path.resolve(typoPath));
-  }
-  const pdfMatch = subPath.match(/^ppt\/(.+)\.pdf$/);
-  if (pdfMatch) {
-    const base = pdfMatch[1];
-    const pptPath = path.join(pptDir, base + ".pptx");
-    const pptPathAlt = path.join(pptDir, base + ".ppt");
-    const toConvert = fs.existsSync(pptPath) ? pptPath : (fs.existsSync(pptPathAlt) ? pptPathAlt : null);
-    if (toConvert) {
-      return convertPptToPdf(toConvert)
-        .then((pdfPath) => {
-          if (pdfPath) return res.sendFile(path.resolve(pdfPath));
-          next();
-        })
-        .catch(() => next());
+  try {
+    if (fs.existsSync(requestedPath)) {
+      const st = fs.statSync(requestedPath);
+      if (st.isFile()) return next();
     }
+    const typoPath = path.join(uploadsDir, subPath.replace(/Social_textbook_chunks/g, "Social_texbook_chunks"));
+    if (fs.existsSync(typoPath) && fs.statSync(typoPath).isFile()) {
+      return res.sendFile(path.resolve(typoPath));
+    }
+
+    let streamed = await assetStorage.getUploadReadableStream(subPath);
+    if (!streamed) {
+      const typoSub = subPath.replace(/Social_textbook_chunks/g, "Social_texbook_chunks");
+      if (typoSub !== subPath) streamed = await assetStorage.getUploadReadableStream(typoSub);
+    }
+    if (streamed?.stream) {
+      const ct = streamed.contentType || contentTypeForUploadPath(subPath);
+      res.setHeader("Content-Type", ct);
+      if (subPath.toLowerCase().endsWith(".pdf")) {
+        res.setHeader("Content-Disposition", "inline");
+      }
+      streamed.stream.on("error", () => {
+        if (!res.headersSent) res.status(500).end();
+      });
+      streamed.stream.pipe(res);
+      return;
+    }
+
+    const pdfMatch = subPath.match(/^ppt\/(.+)\.pdf$/);
+    if (pdfMatch) {
+      const base = pdfMatch[1];
+      const pptPath = path.join(pptDir, base + ".pptx");
+      const pptPathAlt = path.join(pptDir, base + ".ppt");
+      const toConvert = fs.existsSync(pptPath) ? pptPath : (fs.existsSync(pptPathAlt) ? pptPathAlt : null);
+      if (toConvert) {
+        const pdfPath = await convertPptToPdf(toConvert);
+        if (pdfPath) return res.sendFile(path.resolve(pdfPath));
+      } else {
+        let buf = await assetStorage.readUploadBuffer(`ppt/${base}.pptx`);
+        let ext = ".pptx";
+        if (!buf) {
+          buf = await assetStorage.readUploadBuffer(`ppt/${base}.ppt`);
+          ext = ".ppt";
+        }
+        if (buf) {
+          const tmp = path.join(os.tmpdir(), `lms_ppt_${base}${ext}`);
+          try {
+            fs.writeFileSync(tmp, buf);
+            const pdfPath = await convertPptToPdf(tmp);
+            if (pdfPath) return res.sendFile(path.resolve(pdfPath));
+          } finally {
+            try {
+              fs.unlinkSync(tmp);
+            } catch (_) {}
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[uploads] serve error:", err.message);
   }
   next();
 });
 app.use("/uploads", express.static(uploadsDir));
 
-const QR_TYPES = ["A", "B", "C", "D"];
+const QR_TYPES = ["DATA", "A", "B", "C", "D"];
+const APP_BASE_URL = (process.env.APP_BASE_URL || "http://localhost:8080").replace(/\/$/, "");
 
 // Admin emails allowed for login without DB (plain-text password check: passadmin123)
 const STATIC_ADMINS = [
@@ -138,22 +192,35 @@ const STATIC_ADMINS = [
   { email: "admin5@residential.com", full_name: "Admin 5" },
 ];
 
+async function verifyPassword(candidate, storedHashOrPlain) {
+  const cand = String(candidate || "");
+  const stored = String(storedHashOrPlain || "");
+  if (!stored) return false;
+  try {
+    if (stored.startsWith("$2")) return await bcrypt.compare(cand, stored);
+  } catch (_) {}
+  return cand === stored;
+}
+
 async function generateStudentQRCodes(db, studentId) {
   const sid = Number(studentId);
   if (!sid) return [];
+  const [studentRows] = await db.query("SELECT roll_no FROM students WHERE id = ? LIMIT 1", [sid]);
+  const rollNo = Array.isArray(studentRows) && studentRows[0] ? String(studentRows[0].roll_no || sid) : String(sid);
   const created = [];
   for (const qrType of QR_TYPES) {
-    const qrCodeValue = `STU_${sid}_${qrType}`;
-    const filename = `${sid}_${qrType}.png`;
+    const token = `stu${rollNo}_${qrType}`;
+    const qrCodeValue = qrType === "DATA" ? `${APP_BASE_URL}/student/qr/${encodeURIComponent(token)}` : token;
+    const filename = `${rollNo}_${qrType}.png`;
     const relativePath = "qrcodes/" + filename;
-    const absolutePath = path.join(qrcodesDir, filename);
     try {
-      await QRCode.toFile(absolutePath, qrCodeValue, { type: "png", margin: 1 });
+      const pngBuf = await QRCode.toBuffer(qrCodeValue, { type: "png", margin: 1 });
+      await assetStorage.saveUploadBuffer(relativePath, pngBuf, "image/png");
       await db.query(
-        "INSERT INTO student_qr_codes (student_id, qr_type, qr_code_value, qr_image_path) VALUES (?, ?, ?, ?)",
-        [sid, qrType, qrCodeValue, relativePath]
+        "INSERT INTO student_qr_codes (student_id, qr_type, qr_code_value, qr_image_path) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE qr_code_value = VALUES(qr_code_value), qr_image_path = VALUES(qr_image_path)",
+        [sid, qrType, token, relativePath]
       );
-      created.push({ qr_type: qrType, qr_code_value: qrCodeValue, qr_image_path: "/uploads/" + relativePath.replace(/\\/g, "/") });
+      created.push({ qr_type: qrType, qr_code_value: token, qr_image_path: "/uploads/" + relativePath.replace(/\\/g, "/"), qr_payload: qrCodeValue });
     } catch (err) {
       console.error("QR generation error for", qrCodeValue, err.message);
     }
@@ -162,6 +229,131 @@ async function generateStudentQRCodes(db, studentId) {
 }
 
 let pool;
+const liveQuizRuntime = new Map();
+/** Throttle GET /status console spam (poll every few seconds from teacher + mobile). */
+const liveQuizStatusLogSeq = new Map();
+
+/** Set LIVE_QUIZ_CHECKPOINTS=0 to silence [LIVE_QUIZ_CHECK] logs (default: on). */
+function liveQuizCheckpoint(name, data) {
+  if (process.env.LIVE_QUIZ_CHECKPOINTS === "0") return;
+  const ts = new Date().toISOString();
+  if (data !== undefined) console.log(`[LIVE_QUIZ_CHECK] ${ts} ${name}`, data);
+  else console.log(`[LIVE_QUIZ_CHECK] ${ts} ${name}`);
+}
+
+function getRuntimeState(sessionId) {
+  const existing = liveQuizRuntime.get(sessionId);
+  if (existing) return existing;
+  const state = {
+    started: false,
+    connectedDevices: {},
+    currentQuestionNo: 1,
+    progressByQuestion: {},
+    submitted: false,
+  };
+  liveQuizRuntime.set(sessionId, state);
+  return state;
+}
+
+function toDateKey(value) {
+  if (!value) return "";
+  if (typeof value === "string") {
+    const s = value.trim();
+    // Preserve pure date strings exactly (avoid timezone shift via Date parsing).
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T]/);
+    if (m && m[1]) return m[1];
+  }
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    // IMPORTANT: avoid UTC shift for MySQL DATE/DATETIME values.
+    const y = value.getFullYear();
+    const m = String(value.getMonth() + 1).padStart(2, "0");
+    const d = String(value.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  const s = String(value);
+  const parsed = new Date(s);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  return s.slice(0, 10);
+}
+
+/**
+ * Attendance day resolver for live quiz:
+ * 1) Prefer an attendance date for the class on/after live session start date.
+ * 2) Else use live_sessions.session_date.
+ * 3) Else fallback.
+ * This keeps participants dynamic from attendance table while still anchored to this session.
+ */
+async function getQuizAttendanceDate(db, classId, liveSessionId, fallbackDate) {
+  const fb = toDateKey(fallbackDate) || new Date().toISOString().slice(0, 10);
+  const cid = Number(classId);
+  if (!cid) return fb;
+  try {
+    // 1) Prefer today's attendance for this class (dynamic, based on attendance table).
+    const now = new Date();
+    const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const [todayRows] = await db.query(
+      "SELECT date FROM attendance WHERE class_id = ? AND date = ? ORDER BY id DESC LIMIT 1",
+      [cid, todayLocal]
+    );
+    const todayAttendance = todayRows && todayRows[0] && todayRows[0].date ? toDateKey(todayRows[0].date) : null;
+    if (todayAttendance) return todayAttendance;
+
+    // 2) Else use the latest submitted attendance date for this class.
+    const [latestRows] = await db.query(
+      "SELECT date FROM attendance WHERE class_id = ? ORDER BY date DESC, id DESC LIMIT 1",
+      [cid]
+    );
+    const latestAttendance = latestRows && latestRows[0] && latestRows[0].date ? toDateKey(latestRows[0].date) : null;
+    if (latestAttendance) return latestAttendance;
+
+    // 3) Else fallback to linked live session date.
+    if (liveSessionId) {
+      const [rows] = await db.query("SELECT session_date FROM live_sessions WHERE id = ? LIMIT 1", [Number(liveSessionId)]);
+      const r = rows && rows[0] ? rows[0] : null;
+      const sessionDate = r && r.session_date ? toDateKey(r.session_date) : null;
+      if (sessionDate) return sessionDate;
+    }
+    return fb;
+  } catch (_) {
+    return fb;
+  }
+}
+
+function pickLanIpv4() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets || {})) {
+    const entries = nets[name] || [];
+    for (const n of entries) {
+      if (n && n.family === "IPv4" && !n.internal) return n.address;
+    }
+  }
+  return null;
+}
+
+function getPublicAppBase(req) {
+  const fromEnv = (process.env.APP_BASE_URL || "").trim().replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+  const host = String(req.headers.host || "");
+  const lan = pickLanIpv4();
+  if (host && !/localhost|127\.0\.0\.1/i.test(host)) {
+    return `${req.protocol || "http"}://${host.replace(/:\d+$/, "")}:8080`;
+  }
+  if (lan) return `http://${lan}:8080`;
+  return APP_BASE_URL;
+}
+
+function getPublicApiBase(req) {
+  const fromEnv = (process.env.QR_BASE_URL || "").trim().replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+  const host = String(req.headers.host || "");
+  const lan = pickLanIpv4();
+  if (host && !/localhost|127\.0\.0\.1/i.test(host)) {
+    return `${req.protocol || "http"}://${host.replace(/\/$/, "")}`;
+  }
+  if (lan) return `http://${lan}:3001`;
+  return `http://localhost:${PORT}`;
+}
 
 function getPool() {
   if (!pool) {
@@ -174,6 +366,16 @@ function getPool() {
       const user = process.env.MYSQL_USER || "root";
       const password = process.env.MYSQL_PASSWORD || "";
       const database = process.env.MYSQL_DATABASE || "lms";
+      const useSsl =
+        process.env.MYSQL_SSL === "1" ||
+        process.env.MYSQL_SSL === "true" ||
+        /rds\.amazonaws\.com/i.test(host);
+      const sslConfig =
+        useSsl && process.env.MYSQL_SSL_REJECT_UNAUTHORIZED === "0"
+          ? { rejectUnauthorized: false }
+          : useSsl
+            ? {}
+            : undefined;
       pool = mysql.createPool({
         host,
         port,
@@ -181,6 +383,7 @@ function getPool() {
         password,
         database,
         connectTimeout: 15000,
+        ...(sslConfig !== undefined ? { ssl: sslConfig } : {}),
       });
     }
   }
@@ -206,6 +409,104 @@ app.get("/api/db-check", async (req, res) => {
   }
 });
 
+async function hasColumn(db, tableName, columnName) {
+  try {
+    const sql = `
+      SELECT 1 AS ok
+      FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND COLUMN_NAME = ?
+      LIMIT 1
+    `;
+    const [rows] = await db.query(sql, [tableName, columnName]);
+    return Array.isArray(rows) && rows.length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Strict readiness check for live-quiz stack and required migrations.
+app.get("/api/live-quiz-readiness", async (req, res) => {
+  try {
+    const db = getPool();
+    await db.query("SELECT 1");
+    const marksHasLiveQuizSessionId = await hasColumn(db, "student_marks", "live_quiz_session_id");
+    const liveSessionHasSessionDate = await hasColumn(db, "live_sessions", "session_date");
+    const ready = marksHasLiveQuizSessionId && liveSessionHasSessionDate;
+    const checks = {
+      dbConnected: true,
+      studentMarksLiveQuizSessionId: marksHasLiveQuizSessionId,
+      liveSessionsSessionDate: liveSessionHasSessionDate,
+    };
+    if (!ready) {
+      return res.status(503).json({
+        ok: false,
+        ready: false,
+        checks,
+        error: "Live quiz schema not ready. Apply required migrations (including migrate_student_marks_live_quiz.sql).",
+      });
+    }
+    return res.json({ ok: true, ready: true, checks });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      ready: false,
+      error: isConnectionError(err) ? "Database connection failed" : String(err.message || err),
+    });
+  }
+});
+
+async function probeAiEndpoint() {
+  const candidates = Array.from(
+    new Set([
+      String(process.env.VITE_AI_API_URL || "").trim().replace(/\/$/, ""),
+      String(process.env.AI_API_BASE || "").trim().replace(/\/$/, ""),
+      "http://127.0.0.1:8000",
+      "http://localhost:8000",
+    ].filter(Boolean))
+  );
+  for (const base of candidates) {
+    try {
+      const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(4000) });
+      if (r.ok) return { ok: true, base };
+    } catch (_) {
+      // try next candidate
+    }
+  }
+  return { ok: false, base: candidates[0] || "http://127.0.0.1:8000" };
+}
+
+// One-shot stack preflight for local/dev ops: API + DB + live-quiz schema + AI.
+app.get("/api/preflight", async (req, res) => {
+  const report = {
+    api: { ok: true },
+    db: { ok: false },
+    liveQuiz: { ok: false },
+    ai: { ok: false, base: "" },
+  };
+  try {
+    const db = getPool();
+    await db.query("SELECT 1");
+    report.db.ok = true;
+    const marksHasLiveQuizSessionId = await hasColumn(db, "student_marks", "live_quiz_session_id");
+    const liveSessionHasSessionDate = await hasColumn(db, "live_sessions", "session_date");
+    report.liveQuiz.ok = marksHasLiveQuizSessionId && liveSessionHasSessionDate;
+    report.liveQuiz.checks = {
+      studentMarksLiveQuizSessionId: marksHasLiveQuizSessionId,
+      liveSessionsSessionDate: liveSessionHasSessionDate,
+    };
+  } catch (err) {
+    report.db.error = isConnectionError(err) ? "Database connection failed" : String(err.message || err);
+  }
+  const aiProbe = await probeAiEndpoint();
+  report.ai.ok = aiProbe.ok;
+  report.ai.base = aiProbe.base;
+  if (!report.ai.ok) report.ai.error = "AI service unreachable";
+  const ok = report.api.ok && report.db.ok && report.liveQuiz.ok && report.ai.ok;
+  return res.status(ok ? 200 : 503).json({ ok, report });
+});
+
 app.post("/api/auth/login", async (req, res) => {
   const emailTrim = req.body?.email != null ? String(req.body.email).trim() : "";
   const { password } = req.body || {};
@@ -216,9 +517,12 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(400).json({ error: "password is required" });
   }
 
-  // Static admins (no DB row): no password check
+  // Static admins: strict password check
   const staticAdmin = STATIC_ADMINS.find((a) => a.email.toLowerCase() === emailTrim.toLowerCase());
   if (staticAdmin) {
+    if (String(password).trim() !== "passadmin123") {
+      return res.status(401).json({ error: "Invalid admin credentials" });
+    }
     return res.json({
       id: "admin-" + staticAdmin.email.replace(/@.*/, ""),
       email: staticAdmin.email,
@@ -227,70 +531,67 @@ app.post("/api/auth/login", async (req, res) => {
     });
   }
 
-  // DB-backed admins: no password check, only require email to exist
+  // DB-backed admins only
   try {
     const db = getPool();
     const [rows] = await db.query(
-      "SELECT id, email, full_name, role, password_hash FROM admins WHERE email = ? LIMIT 1",
+      "SELECT id, email, name, role, password FROM admins WHERE email = ? LIMIT 1",
       [emailTrim]
     );
     const admin = Array.isArray(rows) && rows[0] ? rows[0] : null;
-    if (!admin) {
-      return res.status(401).json({ error: "Invalid email or password" });
+    if (admin) {
+      const ok = await verifyPassword(password, admin.password);
+      if (!ok) return res.status(401).json({ error: "Invalid admin credentials" });
+      return res.json({
+        id: String(admin.id),
+        email: admin.email,
+        full_name: admin.name || admin.email,
+        role: admin.role || "admin",
+      });
     }
-    res.json({
-      id: String(admin.id),
-      email: admin.email,
-      full_name: admin.full_name || admin.email,
-      role: admin.role || "admin",
-    });
+    return res.status(401).json({ error: "Admin not found" });
   } catch (err) {
     console.error("POST /api/auth/login error:", err);
-    const message = isConnectionError(err)
-      ? "Database unavailable. Please try again later."
-      : (err && err.message) || "Login failed";
-    res.status(500).json({ error: message });
+    return res.status(500).json({ error: "Admin login failed" });
   }
 });
 
 app.post("/api/auth/login/teacher", async (req, res) => {
-  const db = getPool();
-  const { email, password } = req.body || {};
-  if (!email || !String(email).trim()) {
+  const emailTrim = req.body?.email != null ? String(req.body.email).trim() : "";
+  const { password } = req.body || {};
+  if (!emailTrim) {
     return res.status(400).json({ error: "Email is required" });
   }
   if (!password || String(password).trim() === "") {
     return res.status(400).json({ error: "password is required" });
   }
   try {
+    const db = getPool();
     const [rows] = await db.query(
-      "SELECT id, email, full_name, school_id, password_hash FROM teachers WHERE email = ? LIMIT 1",
-      [String(email).trim()]
+      "SELECT id, email, full_name, school_id, password FROM teachers WHERE email = ? LIMIT 1",
+      [emailTrim]
     );
     const teacher = Array.isArray(rows) && rows[0] ? rows[0] : null;
-    if (!teacher) {
-      return res.status(401).json({ error: "Invalid email or password" });
+    if (teacher) {
+      const ok = await verifyPassword(password, teacher.password);
+      if (!ok) return res.status(401).json({ error: "Invalid teacher credentials" });
+      return res.json({
+        id: String(teacher.id),
+        email: teacher.email,
+        full_name: teacher.full_name || teacher.email,
+        school_id: String(teacher.school_id),
+      });
     }
-    // No password check; only require teacher to exist
-    res.json({
-      id: String(teacher.id),
-      email: teacher.email,
-      full_name: teacher.full_name || teacher.email,
-      school_id: String(teacher.school_id),
-    });
+    return res.status(401).json({ error: "Teacher not found" });
   } catch (err) {
     console.error("POST /api/auth/login/teacher error:", err);
-    const message = isConnectionError(err)
-      ? "Database unavailable. Please try again later."
-      : (err && err.message) || "Login failed";
-    res.status(500).json({ error: message });
+    return res.status(500).json({ error: "Teacher login failed" });
   }
 });
 
 app.post("/api/auth/login/student", async (req, res) => {
-  const db = getPool();
-  const { student_id, password } = req.body || {};
-  const sid = student_id != null ? String(student_id).trim() : "";
+  const sid = req.body?.student_id != null ? String(req.body.student_id).trim() : "";
+  const { password } = req.body || {};
   if (!sid) {
     return res.status(400).json({ error: "Student ID is required" });
   }
@@ -299,29 +600,28 @@ app.post("/api/auth/login/student", async (req, res) => {
   }
   const numericId = parseInt(sid, 10);
   if (Number.isNaN(numericId) || numericId < 1) {
-    return res.status(401).json({ error: "Invalid Student ID or password" });
+    return res.status(400).json({ error: "Student ID must be a positive number" });
   }
   try {
+    const db = getPool();
     const [rows] = await db.query(
-      "SELECT id, full_name, school_id, password_hash FROM students WHERE id = ? LIMIT 1",
+      "SELECT id, first_name, last_name, school_id, password FROM students WHERE id = ? LIMIT 1",
       [numericId]
     );
     const student = Array.isArray(rows) && rows[0] ? rows[0] : null;
-    if (!student) {
-      return res.status(401).json({ error: "Invalid Student ID or password" });
+    if (student) {
+      const ok = await verifyPassword(password, student.password);
+      if (!ok) return res.status(401).json({ error: "Invalid student credentials" });
+      return res.json({
+        id: String(student.id),
+        full_name: [student.first_name, student.last_name].filter(Boolean).join(" ").trim() || "Student",
+        school_id: String(student.school_id),
+      });
     }
-    // No password check; only require student to exist
-    res.json({
-      id: String(student.id),
-      full_name: student.full_name || "Student",
-      school_id: String(student.school_id),
-    });
+    return res.status(401).json({ error: "Student not found" });
   } catch (err) {
     console.error("POST /api/auth/login/student error:", err);
-    const message = isConnectionError(err)
-      ? "Database unavailable. Please try again later."
-      : (err && err.message) || "Login failed";
-    res.status(500).json({ error: message });
+    return res.status(500).json({ error: "Student login failed" });
   }
 });
 
@@ -332,6 +632,39 @@ function runQuery(db, sql, params = []) {
       console.error("Query failed:", sql.substring(0, 80), err.message);
       return [];
     });
+}
+
+/** One student_marks row per live quiz session (unique student_id + live_quiz_session_id when column exists). */
+async function upsertStudentMarksFromLiveQuizSession(db, liveQuizSessionId) {
+  const sid = Number(liveQuizSessionId);
+  if (!sid) return;
+  try {
+    const [rows] = await db.query(
+      `SELECT lqa.student_id, lqs.chapter_id, DATE(ls.session_date) AS d,
+              SUM(lqa.is_correct) AS sc, COUNT(*) AS tot
+       FROM live_quiz_answers lqa
+       JOIN live_quiz_sessions lqs ON lqs.id = lqa.live_quiz_session_id
+       JOIN live_sessions ls ON ls.id = lqs.live_session_id
+       WHERE lqa.live_quiz_session_id = ? AND lqs.chapter_id IS NOT NULL
+       GROUP BY lqa.student_id, lqs.chapter_id, ls.session_date`,
+      [sid]
+    );
+    for (const row of rows || []) {
+      await db.query(
+        `INSERT INTO student_marks (student_id, chapter_id, assessment_type, score, total, assessed_on, live_quiz_session_id)
+         VALUES (?, ?, 'live_quiz', ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE score = VALUES(score), total = VALUES(total), assessed_on = VALUES(assessed_on)`,
+        [row.student_id, row.chapter_id, row.sc, row.tot, row.d, sid]
+      );
+    }
+  } catch (err) {
+    const msg = String(err && err.message);
+    if (msg.includes("live_quiz_session_id")) {
+      console.warn("student_marks.live_quiz_session_id missing; run migrate_student_marks_live_quiz.sql — marks not synced from live quiz.");
+    } else {
+      console.error("upsertStudentMarksFromLiveQuizSession:", msg);
+    }
+  }
 }
 
 app.get("/api/all", async (req, res) => {
@@ -348,11 +681,10 @@ app.get("/api/all", async (req, res) => {
       teacherAssignmentsRows,
       topicsRows,
       topicMaterialsRows,
+      topicMicroLessonsRows,
       quizzesRows,
       quizResultsRows,
       attendanceRows,
-      activityLogsRows,
-      classStatusRows,
       teacherLeavesRows,
       classRecordingsRows,
       homeworkRows,
@@ -366,35 +698,64 @@ app.get("/api/all", async (req, res) => {
       liveQuizSessionsRows,
       liveQuizQuestionsRows,
       liveQuizAnswersRows,
+      timetableRows,
+      activityAssignmentsRows,
+      activityParticipationRows,
     ] = await Promise.all([
-      runQuery(db, "SELECT * FROM schools"),
-      runQuery(db, "SELECT * FROM classes"),
+      runQuery(
+        db,
+        "SELECT sc.id, sc.school_name AS name, sc.school_code AS code, COALESCE(sc.district, '') AS district, COALESCE(sc.mandal, '') AS mandal, GREATEST(COALESCE(sc.sessions_completed, 0), COALESCE(ls_cnt.sessions_completed, 0)) AS sessions_completed, COALESCE(sc.active_status, 1) AS active_status FROM schools sc LEFT JOIN (SELECT sec.school_id, COUNT(*) AS sessions_completed FROM live_sessions ls JOIN sections sec ON sec.id = ls.class_id WHERE ls.status = 'ended' GROUP BY sec.school_id) ls_cnt ON ls_cnt.school_id = sc.id"
+      ),
+      runQuery(
+        db,
+        "SELECT sec.id, sec.school_id, CONCAT('Class ', sec.grade_id, '-', sec.section_code) AS name, sec.section_code AS section, sec.grade_id AS grade, COALESCE(st_cnt.student_count, 0) AS student_count FROM sections sec LEFT JOIN (SELECT section_id, COUNT(*) AS student_count FROM students GROUP BY section_id) st_cnt ON st_cnt.section_id = sec.id"
+      ),
       runQuery(db, "SELECT * FROM teachers"),
       runQuery(db, "SELECT * FROM students"),
-      runQuery(db, "SELECT * FROM subjects"),
-      runQuery(db, "SELECT * FROM chapters ORDER BY subject_id, order_num"),
-      runQuery(db, "SELECT * FROM enrollments WHERE academic_year = ?", ["2025-26"]),
-      runQuery(db, "SELECT * FROM teacher_assignments"),
-      runQuery(db, "SELECT * FROM topics ORDER BY chapter_id, order_num"),
-      runQuery(db, "SELECT * FROM topic_materials"),
-      runQuery(db, "SELECT * FROM quizzes"),
-      runQuery(db, "SELECT * FROM quiz_results"),
+      runQuery(
+        db,
+        "SELECT id, subject_name AS name, '📚' AS icon, '10' AS grades FROM subjects ORDER BY FIELD(subject_name, 'Telugu', 'Hindi', 'English', 'Mathematics', 'Physics', 'Biology', 'Social Studies'), subject_name"
+      ),
+      runQuery(
+        db,
+        "SELECT c.id, c.subject_id, c.chapter_name AS name, c.grade_id AS grade, c.chapter_no AS order_num, c.chapter_no, c.macro_month_label AS month_label, c.planned_periods AS periods, c.teaching_plan_summary, NULL AS concepts, ctm.pdf_url AS textbook_chunk_pdf_path FROM chapters c LEFT JOIN (SELECT chapter_id, MAX(id) AS latest_id FROM chapter_textual_materials GROUP BY chapter_id) latest_ctm ON latest_ctm.chapter_id = c.id LEFT JOIN chapter_textual_materials ctm ON ctm.id = latest_ctm.latest_id ORDER BY c.subject_id, c.chapter_no"
+      ),
+      runQuery(db, "SELECT id AS student_id, section_id AS class_id, '2025-26' AS academic_year FROM students"),
+      runQuery(db, "SELECT t.id AS id, t.id AS teacher_id, s.id AS class_id, t.subject_id AS subject_id FROM teachers t JOIN sections s ON s.school_id = t.school_id AND s.grade_id = 10 WHERE t.subject_id IS NOT NULL"),
+      runQuery(
+        db,
+        "SELECT t.id, t.chapter_id, t.name, t.order_num, t.status, COALESCE(tpm.ppt_url, t.topic_ppt_path) AS topic_ppt_path FROM topics t LEFT JOIN (SELECT topic_id, MAX(id) AS latest_id FROM topic_ppt_materials GROUP BY topic_id) latest_tpm ON latest_tpm.topic_id = t.id LEFT JOIN topic_ppt_materials tpm ON tpm.id = latest_tpm.latest_id ORDER BY t.chapter_id, t.order_num"
+      ),
+      runQuery(db, "SELECT id, topic_id, 'ppt' AS type, COALESCE(title,'PPT') AS title, ppt_url AS url FROM topic_ppt_materials"),
+      runQuery(db, "SELECT id, topic_id, period_no, concept_text, plan_text FROM topic_micro_lessons ORDER BY topic_id, period_no"),
+      runQuery(db, "SELECT id, id AS chapter_id FROM chapters WHERE 1=0"),
+      runQuery(
+        db,
+        "SELECT id, student_id, chapter_id, score, total, assessed_on AS taken_on FROM student_marks ORDER BY assessed_on DESC, id DESC"
+      ),
       runQuery(db, "SELECT * FROM attendance"),
-      runQuery(db, "SELECT al.*, t.full_name AS teacher_name, a.full_name AS admin_name FROM activity_logs al LEFT JOIN teachers t ON al.user_role = 'Teacher' AND al.user_id = t.id LEFT JOIN admins a ON al.user_role = 'Admin' AND al.user_id = a.id"),
-      runQuery(db, "SELECT * FROM class_status"),
-      runQuery(db, "SELECT * FROM teacher_leaves"),
-      runQuery(db, "SELECT * FROM class_recordings"),
-      runQuery(db, "SELECT * FROM homework"),
-      runQuery(db, "SELECT * FROM study_materials"),
+      db.query("SELECT * FROM teacher_leaves").then(([r]) => r).catch(() => []),
+      db.query("SELECT * FROM class_recordings").then(([r]) => r).catch(() => []),
+      db.query("SELECT * FROM homework").then(([r]) => r).catch(() => []),
+      runQuery(
+        db,
+        "SELECT CONCAT('ch-', ctm.id) AS id, ctm.chapter_id, 'textbook' AS type, COALESCE(ctm.title, 'Chapter textbook') AS title, ctm.pdf_url AS url FROM chapter_textual_materials ctm UNION ALL SELECT CONCAT('tp-', tpm.id) AS id, t.chapter_id, 'ppt' AS type, COALESCE(tpm.title, 'Topic PPT') AS title, tpm.ppt_url AS url FROM topic_ppt_materials tpm JOIN topics t ON t.id = tpm.topic_id"
+      ),
       runQuery(db, "SELECT * FROM live_sessions"),
-      runQuery(db, "SELECT id, email, full_name, role FROM admins"),
+      runQuery(db, "SELECT id, email, name AS full_name, role FROM admins"),
       db.query("SELECT * FROM chapter_syllabus").then(([r]) => r).catch(() => []),
-      runQuery(db, "SELECT * FROM teacher_effectiveness"),
-      runQuery(db, "SELECT * FROM topic_recommendations").catch(() => []),
-      runQuery(db, "SELECT * FROM topic_recommendation_links ORDER BY topic_recommendation_id, order_num").catch(() => []),
+      runQuery(
+        db,
+        "SELECT tps.teacher_id, t.school_id, t.full_name AS name, ROUND(CASE WHEN MAX(tps.classes_conducted + tps.classes_cancelled) > 0 THEN (MAX(tps.classes_conducted) / MAX(tps.classes_conducted + tps.classes_cancelled)) * 100 ELSE 0 END) AS lesson_completion_rate, ROUND(CASE WHEN MAX(tps.quizzes_conducted) > 0 THEN ((MAX(tps.quiz_participants) - MAX(tps.quiz_absent)) / MAX(tps.quiz_participants)) * 100 ELSE 0 END) AS student_engagement, ROUND(CASE WHEN COUNT(sm.id) > 0 THEN AVG((sm.score / NULLIF(sm.total, 0)) * 100) ELSE 0 END) AS quiz_avg_score, MAX(tps.classes_conducted) AS classes_completed, MAX(tps.classes_conducted + tps.classes_cancelled) AS total_scheduled, ROUND((ROUND(CASE WHEN MAX(tps.classes_conducted + tps.classes_cancelled) > 0 THEN (MAX(tps.classes_conducted) / MAX(tps.classes_conducted + tps.classes_cancelled)) * 100 ELSE 0 END) + ROUND(CASE WHEN COUNT(sm.id) > 0 THEN AVG((sm.score / NULLIF(sm.total, 0)) * 100) ELSE 0 END) + ROUND(CASE WHEN MAX(tps.quizzes_conducted) > 0 THEN ((MAX(tps.quiz_participants) - MAX(tps.quiz_absent)) / MAX(tps.quiz_participants)) * 100 ELSE 0 END)) / 60, 1) AS rating FROM teacher_performance_snapshots tps JOIN teachers t ON t.id = tps.teacher_id LEFT JOIN live_sessions ls ON ls.teacher_id = t.id AND ls.session_date BETWEEN '2026-02-01' AND '2026-02-28' LEFT JOIN live_quiz_sessions lqs ON lqs.live_session_id = ls.id LEFT JOIN student_marks sm ON sm.live_quiz_session_id = lqs.id WHERE tps.snapshot_date = '2026-02-28' GROUP BY tps.teacher_id, t.school_id, t.full_name"
+      ),
+      runQuery(db, "SELECT id, id AS topic_id, chapter_id, NULL AS subject_id, 10 AS grade, name AS topic_name, NULL AS class_id, NULL AS school_id, created_at FROM topics WHERE 1=0").catch(() => []),
+      runQuery(db, "SELECT id, 0 AS topic_recommendation_id, 'youtube' AS type, '' AS title, '' AS url, '' AS description, 0 AS order_num FROM topic_youtube_links WHERE 1=0").catch(() => []),
       runQuery(db, "SELECT * FROM live_quiz_sessions ORDER BY created_at DESC").catch(() => []),
       runQuery(db, "SELECT * FROM live_quiz_questions ORDER BY live_quiz_session_id, order_num").catch(() => []),
       runQuery(db, "SELECT * FROM live_quiz_answers").catch(() => []),
+      runQuery(db, "SELECT class_id, week_day, period_no, subject_name, subject_id, teacher_id, start_time, end_time FROM class_timetables ORDER BY class_id, week_day, period_no").catch(() => []),
+      runQuery(db, "SELECT aa.id, aa.activity_id, aa.teacher_id, aa.class_id, aa.activity_date, aa.status, a.title, a.description FROM activity_assignments aa JOIN activities a ON a.id = aa.activity_id ORDER BY aa.activity_date DESC, aa.id DESC").catch(() => []),
+      runQuery(db, "SELECT activity_assignment_id, student_id, status FROM activity_participation").catch(() => []),
     ]);
 
     const teacherIdsBySchool = {};
@@ -433,11 +794,6 @@ app.get("/api/all", async (req, res) => {
       schoolClassCount[sid] = (schoolClassCount[sid] || 0) + 1;
     });
 
-    const quizIdToChapterId = {};
-    quizzesRows.forEach((q) => {
-      quizIdToChapterId[q.id] = toId(q.chapter_id);
-    });
-
     const topicMaterialsByTopic = {};
     (topicMaterialsRows || []).forEach((tm) => {
       const tid = toId(tm.topic_id);
@@ -447,6 +803,17 @@ app.get("/api/all", async (req, res) => {
         type: tm.type || "doc",
         title: tm.title || "",
         url: tm.url || "#",
+      });
+    });
+    const microLessonsByTopic = {};
+    (topicMicroLessonsRows || []).forEach((ml) => {
+      const tid = toId(ml.topic_id);
+      if (!microLessonsByTopic[tid]) microLessonsByTopic[tid] = [];
+      microLessonsByTopic[tid].push({
+        id: toId(ml.id),
+        periodNo: Number(ml.period_no) || 0,
+        conceptText: ml.concept_text || "",
+        planText: ml.plan_text || "",
       });
     });
 
@@ -489,16 +856,6 @@ app.get("/api/all", async (req, res) => {
       subjects: Array.from(teacherSubjectNames[toId(t.id)] || []),
     }));
 
-    const students = studentsRows.map((s) => ({
-      id: toId(s.id),
-      name: s.full_name,
-      rollNo: s.roll_no,
-      section: s.section || "",
-      classId: enrollmentByStudent[s.id] || null,
-      schoolId: toId(s.school_id),
-      score: 0,
-    }));
-
     const subjects = subjectsRows.map((s) => {
       const gradesStr = s.grades || "";
       const grades = gradesStr ? gradesStr.split(",").map((g) => parseInt(g.trim(), 10)).filter((n) => !isNaN(n)) : [];
@@ -532,36 +889,91 @@ app.get("/api/all", async (req, res) => {
       status: t.status || "not_started",
       topicPptPath: t.topic_ppt_path ?? null,
       materials: topicMaterialsByTopic[toId(t.id)] || [],
+      microLessons: (microLessonsByTopic[toId(t.id)] || []).sort((a, b) => a.periodNo - b.periodNo),
     }));
 
     const studentQuizResults = quizResultsRows.map((r) => ({
       studentId: toId(r.student_id),
-      chapterId: quizIdToChapterId[r.quiz_id] || toId(r.quiz_id),
-      score: r.score ?? 0,
-      total: r.total ?? 0,
-      date: r.submitted_at ? (r.submitted_at instanceof Date ? r.submitted_at.toISOString().slice(0, 10) : String(r.submitted_at).slice(0, 10)) : null,
+      chapterId: toId(r.chapter_id != null ? r.chapter_id : r.quiz_id),
+      score: Number(r.score) || 0,
+      total: Number(r.total) || 0,
+      date: r.taken_on
+        ? r.taken_on instanceof Date
+          ? r.taken_on.toISOString().slice(0, 10)
+          : String(r.taken_on).slice(0, 10)
+        : null,
       answers: [],
     }));
 
-    const activityLogs = (activityLogsRows || []).map((a) => ({
-      id: toId(a.id),
-      user: a.teacher_name || a.admin_name || a.full_name || `User ${a.user_id}`,
-      role: a.user_role || "Teacher",
-      action: a.action || "",
-      school: a.school_name || "",
-      class: a.class_name || "",
-      timestamp: a.created_at ? (a.created_at instanceof Date ? a.created_at.toISOString().replace("T", " ").slice(0, 19) : String(a.created_at)) : "",
-      gps: a.gps || "",
-    }));
+    const avgPctByStudent = {};
+    studentQuizResults.forEach((r) => {
+      const p = r.total > 0 ? Math.round((r.score / r.total) * 100) : 0;
+      const sid = r.studentId;
+      if (!avgPctByStudent[sid]) avgPctByStudent[sid] = { sum: 0, n: 0 };
+      avgPctByStudent[sid].sum += p;
+      avgPctByStudent[sid].n += 1;
+    });
 
-    const classStatus = classStatusRows.map((c) => ({
-      id: toId(c.id),
-      date: c.date ? String(c.date).slice(0, 10) : "",
-      classId: toId(c.class_id),
-      status: c.status || "conducted",
-      teacherId: toId(c.teacher_id),
-      reason: c.reason || null,
-    }));
+    const students = studentsRows.map((s) => {
+      const id = toId(s.id);
+      const agg = avgPctByStudent[id];
+      return {
+        id,
+        name: [s.first_name, s.last_name].filter(Boolean).join(" ").trim() || `Student ${id}`,
+        rollNo: Number(s.roll_no) || Number(id),
+        section: classesRows.find((c) => toId(c.id) === toId(s.section_id))?.section || "",
+        classId: enrollmentByStudent[s.id] || null,
+        schoolId: toId(s.school_id),
+        score: agg && agg.n > 0 ? Math.round(agg.sum / agg.n) : 0,
+      };
+    });
+
+    const classStatus = (liveSessionsRows || [])
+      .filter((ls) => Boolean(ls?.session_date))
+      .map((ls) => ({
+        id: `ls-${toId(ls.id)}`,
+        date: ls.session_date ? String(ls.session_date).slice(0, 10) : "",
+        classId: toId(ls.class_id),
+        subjectId: toId(ls.subject_id),
+        status: ls.status === "cancelled" ? "cancelled" : "conducted",
+        teacherId: toId(ls.teacher_id),
+        reason: ls.status === "cancelled" ? "Session cancelled" : null,
+      }));
+
+    const activityLogs = [];
+    (liveSessionsRows || [])
+      .slice()
+      .sort((a, b) => String(b.start_time || "").localeCompare(String(a.start_time || "")))
+      .slice(0, 500)
+      .forEach((ls) => {
+        const teacher = teachers.find((t) => t.id === toId(ls.teacher_id));
+        const cls = classes.find((c) => c.id === toId(ls.class_id));
+        const school = schools.find((s) => s.id === cls?.schoolId);
+        activityLogs.push({
+          id: `ls-${toId(ls.id)}`,
+          user: teacher?.name || `Teacher ${toId(ls.teacher_id)}`,
+          role: "Teacher",
+          action: `${ls.status === "cancelled" ? "Cancelled" : "Completed"} live class • ${ls.topic_name || "Session"}`,
+          school: school?.name || "",
+          class: cls?.name || "",
+          timestamp: ls.start_time ? String(ls.start_time).replace("T", " ").slice(0, 19) : "",
+          gps: "-",
+        });
+      });
+    (teacherLeavesRows || []).forEach((lv) => {
+      const teacher = teachers.find((t) => t.id === toId(lv.teacher_id));
+      const school = schools.find((s) => s.id === teacher?.schoolId);
+      activityLogs.push({
+        id: `leave-${toId(lv.id)}`,
+        user: teacher?.name || `Teacher ${toId(lv.teacher_id)}`,
+        role: "Teacher",
+        action: `Leave ${lv.status || "pending"} • ${lv.reason || ""}`.trim(),
+        school: school?.name || "",
+        class: "-",
+        timestamp: lv.applied_on ? String(lv.applied_on).slice(0, 10) : "",
+        gps: "-",
+      });
+    });
 
     const leaveApplications = (teacherLeavesRows || []).map((l) => ({
       id: toId(l.id),
@@ -629,7 +1041,14 @@ app.get("/api/all", async (req, res) => {
       quizSubmitted: Boolean(ls.quiz_submitted),
       recordingId: ls.recording_id || null,
     }));
-    if (liveSessionsList.length === 0 && schools.length > 0 && classes.length > 0) {
+    // Only synthesize sessions when explicitly enabled (e.g. empty DB demos).
+    // Restored DB dumps should show exactly what is in `live_sessions`.
+    if (
+      process.env.SYNTHETIC_LIVE_SESSIONS === "true" &&
+      liveSessionsList.length === 0 &&
+      schools.length > 0 &&
+      classes.length > 0
+    ) {
       const bySchool = {};
       classes.forEach((c) => {
         const sid = c.schoolId;
@@ -767,6 +1186,29 @@ app.get("/api/all", async (req, res) => {
         teachingPlan: row.teaching_plan || "",
       });
     });
+    if (Object.keys(syllabusByChapter).length === 0) {
+      // Fallback: derive a "whole year micro lesson plan" style summary from topic micro-lessons.
+      chapters.forEach((ch) => {
+        const chapterTopics = topics.filter((t) => t.chapterId === ch.id);
+        const lines = [];
+        chapterTopics.forEach((t) => {
+          (t.microLessons || []).forEach((ml) => {
+            lines.push(`${t.name} P${ml.periodNo}: ${ml.planText || ml.conceptText || ""}`.trim());
+          });
+        });
+        if (lines.length > 0) {
+          syllabusByChapter[ch.id] = [{
+            id: `fallback-${ch.id}`,
+            subjectId: ch.subjectId,
+            grade: ch.grade,
+            monthLabel: ch.monthLabel || "Whole year",
+            weekLabel: "Topic micro plan",
+            periods: ch.periods || lines.length,
+            teachingPlan: lines.join("\n"),
+          }];
+        }
+      });
+    }
     const curriculum = {
       syllabusByChapter,
       currentWeekChapterIds: Array.from(currentWeekChapterIds),
@@ -846,6 +1288,33 @@ app.get("/api/all", async (req, res) => {
       isCorrect: Boolean(a.is_correct),
       createdAt: a.created_at ? String(a.created_at) : null,
     }));
+    const timetables = (timetableRows || []).map((t) => ({
+      classId: toId(t.class_id),
+      weekDay: Number(t.week_day) || 1,
+      periodNo: Number(t.period_no) || 1,
+      subjectName: String(t.subject_name || ""),
+      subjectId: t.subject_id != null ? toId(t.subject_id) : null,
+      teacherId: t.teacher_id != null ? toId(t.teacher_id) : null,
+      startTime: String(t.start_time || ""),
+      endTime: String(t.end_time || ""),
+    }));
+    const participationByAssignment = {};
+    (activityParticipationRows || []).forEach((p) => {
+      const key = toId(p.activity_assignment_id);
+      if (!participationByAssignment[key]) participationByAssignment[key] = 0;
+      if ((p.status || "participated") === "participated") participationByAssignment[key] += 1;
+    });
+    const coCurricularActivities = (activityAssignmentsRows || []).map((a) => ({
+      id: toId(a.id),
+      title: String(a.title || "Activity"),
+      description: String(a.description || ""),
+      date: a.activity_date ? String(a.activity_date).slice(0, 10) : "",
+      status: String(a.status || "assigned"),
+      icon: "🏅",
+      registrations: participationByAssignment[toId(a.id)] || 0,
+      classId: a.class_id != null ? toId(a.class_id) : null,
+      teacherId: a.teacher_id != null ? toId(a.teacher_id) : null,
+    }));
 
     const totalQuizAttempts = studentQuizResults.reduce((sum, r) => sum + (r.total || 0), 0);
     const totalQuizScore = studentQuizResults.reduce((sum, r) => sum + (r.score || 0), 0);
@@ -879,6 +1348,8 @@ app.get("/api/all", async (req, res) => {
       topicRecommendations,
       liveQuizSessions: liveQuizSessionsData,
       liveQuizAnswers: liveQuizAnswersData,
+      timetables,
+      coCurricularActivities,
     });
   } catch (err) {
     console.error("GET /api/all error:", err);
@@ -891,32 +1362,49 @@ app.get("/api/all", async (req, res) => {
 
 app.post("/api/students", async (req, res) => {
   const db = getPool();
-  const { full_name, roll_no, section, school_id, class_id, password } = req.body || {};
-  if (!full_name || !school_id) {
-    return res.status(400).json({ error: "full_name and school_id are required" });
+  const { full_name, first_name, last_name, section, school_id, section_id, grade_id, joined_at, password } = req.body || {};
+  if (!school_id) {
+    return res.status(400).json({ error: "school_id is required" });
   }
   if (!password || String(password).trim() === "") {
     return res.status(400).json({ error: "password is required for student login" });
   }
   const passwordPlain = String(password).trim();
   try {
+    const schoolIdNum = Number(school_id);
+    if (!schoolIdNum) return res.status(400).json({ error: "valid school_id required" });
+    let resolvedSectionId = section_id != null ? Number(section_id) : null;
+    if (!resolvedSectionId) {
+      const sectionCode = section ? String(section).trim().toUpperCase() : "A";
+      const gradeIdNum = grade_id != null ? Number(grade_id) : 10;
+      const [secRows] = await db.query(
+        "SELECT id FROM sections WHERE school_id = ? AND grade_id = ? AND section_code = ? LIMIT 1",
+        [schoolIdNum, gradeIdNum, sectionCode]
+      );
+      if (Array.isArray(secRows) && secRows[0]) {
+        resolvedSectionId = Number(secRows[0].id);
+      } else {
+        const [insSec] = await db.query(
+          "INSERT INTO sections (school_id, grade_id, section_code) VALUES (?, ?, ?)",
+          [schoolIdNum, gradeIdNum, sectionCode]
+        );
+        resolvedSectionId = Number(insSec.insertId);
+      }
+    }
+    const fullName = String(full_name || "").trim();
+    const firstNameResolved = String(first_name || (fullName.split(" ")[0] || "Student")).trim();
+    const lastNameResolved = String(last_name || fullName.split(" ").slice(1).join(" ") || "Demo").trim();
     const [insertResult] = await db.query(
-      "INSERT INTO students (full_name, roll_no, section, school_id, password_hash) VALUES (?, ?, ?, ?, ?)",
-      [String(full_name).trim(), roll_no != null ? Number(roll_no) : 0, section ? String(section).trim() : null, Number(school_id), passwordPlain]
+      "INSERT INTO students (school_id, section_id, first_name, last_name, password, joined_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [schoolIdNum, resolvedSectionId, firstNameResolved, lastNameResolved, passwordPlain, joined_at ? String(joined_at).slice(0, 10) : new Date().toISOString().slice(0, 10)]
     );
     const studentId = insertResult.insertId;
-    if (class_id && studentId) {
-      await db.query(
-        "INSERT INTO enrollments (student_id, class_id, academic_year) VALUES (?, ?, ?)",
-        [studentId, Number(class_id), "2025-26"]
-      ).catch(() => {});
-    }
     try {
       await generateStudentQRCodes(db, studentId);
     } catch (qrErr) {
       console.error("QR code generation failed for student", studentId, qrErr.message);
     }
-    res.status(201).json({ id: String(studentId), full_name: String(full_name).trim(), school_id: String(school_id), class_id: class_id ? String(class_id) : null });
+    res.status(201).json({ id: String(studentId), full_name: `${firstNameResolved} ${lastNameResolved}`.trim(), school_id: String(schoolIdNum), section_id: String(resolvedSectionId) });
   } catch (err) {
     console.error("POST /api/students error:", err);
     res.status(500).json({ error: String(err.message) });
@@ -936,7 +1424,7 @@ app.post("/api/teachers", async (req, res) => {
   const passwordPlain = String(password).trim();
   try {
     const [insertResult] = await db.query(
-      "INSERT INTO teachers (full_name, email, school_id, password_hash) VALUES (?, ?, ?, ?)",
+      "INSERT INTO teachers (full_name, email, school_id, password) VALUES (?, ?, ?, ?)",
       [String(full_name).trim(), emailVal, Number(school_id), passwordPlain]
     );
     const teacherId = insertResult.insertId;
@@ -960,7 +1448,7 @@ app.put("/api/teachers/:id", async (req, res) => {
     if (school_id !== undefined) { updates.push("school_id = ?"); values.push(Number(school_id)); }
     if (password !== undefined) {
       const plain = password && String(password).trim() ? String(password).trim() : null;
-      updates.push("password_hash = ?");
+      updates.push("password = ?");
       values.push(plain);
     }
     if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
@@ -978,7 +1466,6 @@ app.delete("/api/teachers/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ error: "id required" });
   try {
-    await db.query("DELETE FROM teacher_assignments WHERE teacher_id = ?", [id]);
     const [r] = await db.query("DELETE FROM teachers WHERE id = ?", [id]);
     res.json({ deleted: r.affectedRows > 0 });
   } catch (err) {
@@ -993,7 +1480,20 @@ app.get("/api/teachers/:id/assignments", async (req, res) => {
   if (!id) return res.status(400).json({ error: "id required" });
   try {
     const [rows] = await db.query(
-      "SELECT ta.id, ta.teacher_id, ta.class_id, ta.subject_id, c.school_id, s.name AS subject_name, c.name AS class_name, sc.name AS school_name FROM teacher_assignments ta LEFT JOIN subjects s ON s.id = ta.subject_id LEFT JOIN classes c ON c.id = ta.class_id LEFT JOIN schools sc ON sc.id = c.school_id WHERE ta.teacher_id = ?",
+      `SELECT
+         t.id AS id,
+         t.id AS teacher_id,
+         sec.id AS class_id,
+         t.subject_id AS subject_id,
+         t.school_id AS school_id,
+         subj.subject_name AS subject_name,
+         CONCAT('Class ', sec.grade_id, '-', sec.section_code) AS class_name,
+         sch.school_name AS school_name
+       FROM teachers t
+       LEFT JOIN subjects subj ON subj.id = t.subject_id
+       LEFT JOIN sections sec ON sec.school_id = t.school_id AND sec.grade_id = 10 AND sec.section_code = 'A'
+       LEFT JOIN schools sch ON sch.id = t.school_id
+       WHERE t.id = ?`,
       [id]
     );
     const list = (rows || []).map((r) => ({
@@ -1022,18 +1522,10 @@ app.put("/api/teachers/:id/assignments", async (req, res) => {
     if (school_id !== undefined) {
       await db.query("UPDATE teachers SET school_id = ? WHERE id = ?", [Number(school_id), id]);
     }
-    await db.query("DELETE FROM teacher_assignments WHERE teacher_id = ?", [id]);
     if (Array.isArray(assignments) && assignments.length > 0) {
-      for (const a of assignments) {
-        const cid = a.class_id != null ? Number(a.class_id) : null;
-        const subid = a.subject_id != null ? Number(a.subject_id) : null;
-        if (cid != null && subid != null) {
-          await db.query(
-            "INSERT INTO teacher_assignments (teacher_id, class_id, subject_id) VALUES (?, ?, ?)",
-            [id, cid, subid]
-          );
-        }
-      }
+      const first = assignments[0];
+      const subid = first && first.subject_id != null ? Number(first.subject_id) : null;
+      if (subid != null) await db.query("UPDATE teachers SET subject_id = ? WHERE id = ?", [subid, id]);
     }
     res.json({ updated: true });
   } catch (err) {
@@ -1050,13 +1542,31 @@ app.put("/api/students/:id", async (req, res) => {
   try {
     const updates = [];
     const values = [];
-    if (full_name !== undefined) { updates.push("full_name = ?"); values.push(String(full_name).trim()); }
+    if (full_name !== undefined) {
+      const fn = String(full_name).trim();
+      const first = fn.split(" ")[0] || "";
+      const last = fn.split(" ").slice(1).join(" ") || "";
+      updates.push("first_name = ?");
+      values.push(first);
+      updates.push("last_name = ?");
+      values.push(last);
+    }
     if (roll_no !== undefined) { updates.push("roll_no = ?"); values.push(Number(roll_no)); }
-    if (section !== undefined) { updates.push("section = ?"); values.push(section ? String(section).trim() : null); }
+    if (section !== undefined && school_id !== undefined) {
+      const sec = section ? String(section).trim().toUpperCase() : "A";
+      const [secRows] = await db.query(
+        "SELECT id FROM sections WHERE school_id = ? AND grade_id = 10 AND section_code = ? LIMIT 1",
+        [Number(school_id), sec]
+      );
+      if (Array.isArray(secRows) && secRows[0]) {
+        updates.push("section_id = ?");
+        values.push(Number(secRows[0].id));
+      }
+    }
     if (school_id !== undefined) { updates.push("school_id = ?"); values.push(Number(school_id)); }
     if (password !== undefined) {
       const plain = password && String(password).trim() ? String(password).trim() : null;
-      updates.push("password_hash = ?");
+      updates.push("password = ?");
       values.push(plain);
     }
     if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
@@ -1074,7 +1584,6 @@ app.delete("/api/students/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ error: "id required" });
   try {
-    const [r] = await db.query("DELETE FROM enrollments WHERE student_id = ?", [id]);
     const [r2] = await db.query("DELETE FROM students WHERE id = ?", [id]);
     res.json({ deleted: r2.affectedRows > 0 });
   } catch (err) {
@@ -1128,17 +1637,85 @@ app.get("/api/admin/student/:id/qrcodes/download", async (req, res) => {
     });
     archive.pipe(res);
     for (const row of rows) {
-      const filename = `${id}_${row.qr_type}.png`;
-      const absolutePath = path.join(qrcodesDir, filename);
+      const storedPath = row.qr_image_path ? String(row.qr_image_path).replace(/^\/?uploads\/?/, "") : "";
       const name = `student_${id}_${row.qr_type}.png`;
-      if (fs.existsSync(absolutePath)) {
-        archive.file(absolutePath, { name });
+      if (!storedPath) continue;
+      const got = await assetStorage.getUploadReadableStream(storedPath);
+      if (got?.stream) {
+        archive.append(got.stream, { name });
       }
     }
     await archive.finalize();
   } catch (err) {
     console.error("GET /api/admin/student/:id/qrcodes/download error:", err);
     if (!res.headersSent) res.status(500).json({ error: String(err.message) });
+  }
+});
+
+// Generate QR image files for all students already present in DB (useful after SQL seed import).
+app.post("/api/admin/qrcodes/generate-all-students", async (req, res) => {
+  const db = getPool();
+  try {
+    const [rows] = await db.query("SELECT id FROM students ORDER BY id");
+    const studentIds = Array.isArray(rows) ? rows.map((r) => Number(r.id)).filter(Boolean) : [];
+    let generatedFor = 0;
+    for (const sid of studentIds) {
+      await generateStudentQRCodes(db, sid);
+      generatedFor += 1;
+    }
+    res.json({ ok: true, studentsProcessed: generatedFor });
+  } catch (err) {
+    console.error("POST /api/admin/qrcodes/generate-all-students error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.get("/api/student-qr/:token", async (req, res) => {
+  const db = getPool();
+  const token = req.params.token ? decodeURIComponent(String(req.params.token)) : "";
+  if (!token) return res.status(400).json({ error: "token required" });
+  try {
+    const [rows] = await db.query(
+      `SELECT
+          sq.student_id,
+          sq.qr_type,
+          sq.qr_code_value,
+          st.first_name,
+          st.last_name,
+          st.roll_no,
+          st.school_id,
+          sc.school_name,
+          sc.school_code,
+          sec.section_code,
+          sec.grade_id
+       FROM student_qr_codes sq
+       JOIN students st ON st.id = sq.student_id
+       LEFT JOIN schools sc ON sc.id = st.school_id
+       LEFT JOIN sections sec ON sec.id = st.section_id
+       WHERE sq.qr_code_value = ?
+       LIMIT 1`,
+      [token]
+    );
+    const row = Array.isArray(rows) && rows[0] ? rows[0] : null;
+    if (!row) return res.status(404).json({ error: "QR not found" });
+    const studentName = [row.first_name, row.last_name].filter(Boolean).join(" ").trim();
+    res.json({
+      qrType: row.qr_type,
+      qrCodeValue: row.qr_code_value,
+      student: {
+        id: String(row.student_id),
+        name: studentName || "Student",
+        rollNo: row.roll_no != null ? String(row.roll_no) : "",
+        schoolId: row.school_id != null ? String(row.school_id) : "",
+        schoolName: row.school_name || "",
+        schoolCode: row.school_code != null ? String(row.school_code) : "",
+        grade: row.grade_id != null ? Number(row.grade_id) : null,
+        section: row.section_code || "",
+      },
+    });
+  } catch (err) {
+    console.error("GET /api/student-qr/:token error:", err);
+    res.status(500).json({ error: String(err.message) });
   }
 });
 
@@ -1150,8 +1727,15 @@ app.post("/api/schools", async (req, res) => {
   }
   try {
     const [insertResult] = await db.query(
-      "INSERT INTO schools (name, code, district, mandal, sessions_completed, active_status) VALUES (?, ?, ?, ?, ?, ?)",
-      [String(name).trim(), String(code).trim(), String(district).trim(), mandal != null ? String(mandal).trim() : null, sessions_completed != null ? Number(sessions_completed) : 0, active_status !== false ? 1 : 0]
+      "INSERT INTO schools (school_name, school_code, district, mandal, sessions_completed, active_status) VALUES (?, ?, ?, ?, ?, ?)",
+      [
+        String(name).trim(),
+        String(code).trim(),
+        String(district).trim(),
+        mandal != null ? String(mandal).trim() : null,
+        sessions_completed != null ? Number(sessions_completed) : 0,
+        active_status !== false ? 1 : 0,
+      ]
     );
     const id = insertResult.insertId;
     res.status(201).json({ id: String(id), name: String(name).trim(), code: String(code).trim(), district: String(district).trim(), mandal: mandal != null ? String(mandal).trim() : null });
@@ -1169,8 +1753,8 @@ app.put("/api/schools/:id", async (req, res) => {
   try {
     const updates = [];
     const values = [];
-    if (name !== undefined) { updates.push("name = ?"); values.push(String(name).trim()); }
-    if (code !== undefined) { updates.push("code = ?"); values.push(String(code).trim()); }
+    if (name !== undefined) { updates.push("school_name = ?"); values.push(String(name).trim()); }
+    if (code !== undefined) { updates.push("school_code = ?"); values.push(String(code).trim()); }
     if (district !== undefined) { updates.push("district = ?"); values.push(String(district).trim()); }
     if (mandal !== undefined) { updates.push("mandal = ?"); values.push(mandal != null ? String(mandal).trim() : null); }
     if (sessions_completed !== undefined) { updates.push("sessions_completed = ?"); values.push(Number(sessions_completed)); }
@@ -1221,6 +1805,45 @@ app.post("/api/teachers/leave", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /api/teachers/leave error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.get("/api/teachers/leave", async (req, res) => {
+  const db = getPool();
+  try {
+    const [rows] = await db.query(
+      "SELECT id, teacher_id, start_date, reason, status, applied_on FROM teacher_leaves ORDER BY applied_on DESC, id DESC"
+    );
+    res.json({
+      leaves: (rows || []).map((r) => ({
+        id: String(r.id),
+        teacherId: String(r.teacher_id),
+        date: r.start_date ? String(r.start_date).slice(0, 10) : "",
+        reason: r.reason || "",
+        status: r.status || "pending",
+        appliedOn: r.applied_on ? String(r.applied_on).slice(0, 10) : "",
+      })),
+    });
+  } catch (err) {
+    console.error("GET /api/teachers/leave error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.put("/api/teachers/leave/:id/status", async (req, res) => {
+  const db = getPool();
+  const id = Number(req.params.id);
+  const status = String(req.body?.status || "").trim().toLowerCase();
+  if (!id) return res.status(400).json({ error: "leave id required" });
+  if (!["pending", "approved", "rejected"].includes(status)) {
+    return res.status(400).json({ error: "status must be pending | approved | rejected" });
+  }
+  try {
+    await db.query("UPDATE teacher_leaves SET status = ? WHERE id = ?", [status, id]);
+    res.json({ ok: true, id: String(id), status });
+  } catch (err) {
+    console.error("PUT /api/teachers/leave/:id/status error:", err);
     res.status(500).json({ error: String(err.message) });
   }
 });
@@ -1298,6 +1921,20 @@ app.post("/api/topic-recommendations", async (req, res) => {
     }
     res.status(201).json({ id: String(recId), topicId: String(topicId), saved: true });
   } catch (err) {
+    const code = String(err?.code || "");
+    const msg = String(err?.message || "");
+    const missingOptionalTable =
+      code === "ER_NO_SUCH_TABLE" &&
+      (msg.includes("topic_recommendations") || msg.includes("topic_recommendation_links"));
+    if (missingOptionalTable) {
+      // Recommendations persistence is optional for teacher UX; do not fail request if tables are not migrated yet.
+      return res.status(200).json({
+        id: null,
+        topicId: String(topicId),
+        saved: false,
+        warning: "topic_recommendations tables missing; skipping persistence",
+      });
+    }
     console.error("POST /api/topic-recommendations error:", err);
     res.status(500).json({ error: String(err.message) });
   }
@@ -1306,10 +1943,119 @@ app.post("/api/topic-recommendations", async (req, res) => {
 // ---------- Live quiz (AI-generated MCQs; student answers; leaderboard; result analysis) ----------
 const AI_API_BASE = process.env.AI_API_BASE || "http://localhost:8000";
 const QUIZ_API_URL = (process.env.QUIZ_API_URL || "https://quiz-1-qo31.onrender.com").replace(/\/$/, "");
+const ALLOW_PLACEHOLDER_QUIZ = String(process.env.ALLOW_PLACEHOLDER_QUIZ || "").toLowerCase() === "true";
 
 const QUIZ_FETCH_TIMEOUT_MS = 8000; // fail fast so UI doesn't hang 30+ seconds
+const STATIC_SOCIAL_CH1_TOPIC_IDS = new Set([645, 646, 647, 648, 649, 650, 651, 652]);
 
-async function fetchQuizQuestions(topicName, subjectName, grade = 10) {
+function staticSocialChapter1Questions(topicName) {
+  const t = String(topicName || "India: Relief Features");
+  return [
+    {
+      question_text: `${t}: The Himalayan Mountains are located mostly in which part of India?`,
+      option_a: "Northern India",
+      option_b: "Southern India",
+      option_c: "Western India",
+      option_d: "Central India",
+      correct_option: "A",
+      explanation: "The Himalayas form India's northern mountain barrier.",
+    },
+    {
+      question_text: `${t}: The Northern Plains were mainly formed by which river systems?`,
+      option_a: "Narmada and Tapi",
+      option_b: "Ganga, Indus and Brahmaputra",
+      option_c: "Godavari and Krishna only",
+      option_d: "Mahanadi and Cauvery",
+      correct_option: "B",
+      explanation: "These three major systems deposited fertile alluvium.",
+    },
+    {
+      question_text: `${t}: Which plateau lies to the south of the Northern Plains?`,
+      option_a: "Malwa Plateau",
+      option_b: "Deccan Plateau",
+      option_c: "Chotanagpur Plateau",
+      option_d: "Meghalaya Plateau",
+      correct_option: "B",
+      explanation: "The Deccan Plateau is the large peninsular plateau.",
+    },
+    {
+      question_text: `${t}: The Thar Desert is mainly found in which state?`,
+      option_a: "Gujarat",
+      option_b: "Rajasthan",
+      option_c: "Madhya Pradesh",
+      option_d: "Haryana",
+      correct_option: "B",
+      explanation: "Most of the Thar Desert lies in western Rajasthan.",
+    },
+    {
+      question_text: `${t}: The Western Ghats are also known as what?`,
+      option_a: "Nilgiri Hills",
+      option_b: "Aravalli Range",
+      option_c: "Sahyadri",
+      option_d: "Vindhya",
+      correct_option: "C",
+      explanation: "Western Ghats are commonly called the Sahyadri range.",
+    },
+    {
+      question_text: `${t}: Which coast lies between the Western Ghats and the Arabian Sea?`,
+      option_a: "Coromandel Coast",
+      option_b: "Konkan and Malabar Coast",
+      option_c: "Northern Circars",
+      option_d: "Sundarbans Coast",
+      correct_option: "B",
+      explanation: "The western coastal plain includes Konkan and Malabar.",
+    },
+    {
+      question_text: `${t}: Which island group lies in the Arabian Sea?`,
+      option_a: "Andaman and Nicobar Islands",
+      option_b: "Lakshadweep Islands",
+      option_c: "Sri Lanka",
+      option_d: "Maldives",
+      correct_option: "B",
+      explanation: "Lakshadweep islands are located in the Arabian Sea.",
+    },
+    {
+      question_text: `${t}: Black soil in India is most suitable for which crop?`,
+      option_a: "Tea",
+      option_b: "Cotton",
+      option_c: "Coffee",
+      option_d: "Jute",
+      correct_option: "B",
+      explanation: "Black soil (regur) is known for cotton cultivation.",
+    },
+    {
+      question_text: `${t}: Which of these is an old fold mountain range in India?`,
+      option_a: "Aravalli",
+      option_b: "Himalaya",
+      option_c: "Western Ghats",
+      option_d: "Eastern Ghats",
+      correct_option: "B",
+      explanation: "The Himalayas are geologically young fold mountains.",
+    },
+    {
+      question_text: `${t}: The broad flat fertile areas of northern India are called what?`,
+      option_a: "Peninsular Plateau",
+      option_b: "Northern Plains",
+      option_c: "Coastal Plains",
+      option_d: "Desert Plains",
+      correct_option: "B",
+      explanation: "Alluvial deposits formed the extensive Northern Plains.",
+    },
+  ];
+}
+
+async function fetchQuizQuestions(topicName, subjectName, grade = 10, meta = {}) {
+  const topicIdNum = meta && meta.topicId != null ? Number(meta.topicId) : null;
+  const subjectText = String(subjectName || "").toLowerCase();
+  const topicText = String(topicName || "").toLowerCase();
+  const shouldUseStaticSocial =
+    STATIC_SOCIAL_CH1_TOPIC_IDS.has(topicIdNum) ||
+    (subjectText.includes("social") && (topicText.includes("relief") || topicText.includes("india")));
+  if (shouldUseStaticSocial) {
+    const staticQs = staticSocialChapter1Questions(topicName);
+    liveQuizCheckpoint("fetchQuizQuestions:static_social_ch1", { topicId: topicIdNum, topicName, count: staticQs.length });
+    return staticQs;
+  }
   const body = { topic_name: topicName, subject: subjectName, grade };
   const opts = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   const fetchWithTimeout = (url) => {
@@ -1340,6 +2086,51 @@ async function fetchQuizQuestions(topicName, subjectName, grade = 10) {
   return [];
 }
 
+// External quiz app compatibility endpoint.
+// Many quiz UIs call POST /generate_quiz directly (Render quiz service style).
+// This endpoint makes our backend act as that quiz service (local AI first, then QUIZ_API_URL fallback).
+app.post("/generate_quiz", async (req, res) => {
+  const { topic_name, topicName, subject, subjectName, grade } = req.body || {};
+  const t = String(topic_name || topicName || "").trim();
+  const s = String(subject || subjectName || "").trim();
+  const gRaw = grade != null ? Number(grade) : 10;
+  const g = Number.isFinite(gRaw) ? gRaw : 10;
+  if (!t) return res.status(400).json({ error: "topic_name is required" });
+  try {
+    const questions = await fetchQuizQuestions(t, s || "Subject", g);
+    // Normalize to the expected payload shape.
+    const normalized = (questions || []).slice(0, 15).map((q, i) => ({
+      question_text: String(q.question_text || q.questionText || `Question ${i + 1}`).slice(0, 2000),
+      option_a: String(q.option_a || q.optionA || "A").slice(0, 512),
+      option_b: String(q.option_b || q.optionB || "B").slice(0, 512),
+      option_c: String(q.option_c || q.optionC || "C").slice(0, 512),
+      option_d: String(q.option_d || q.optionD || "D").slice(0, 512),
+      correct_option: String(q.correct_option || q.correctOption || "A").toUpperCase().charAt(0),
+      explanation: String(q.explanation || "").slice(0, 1000),
+    }));
+    const questionsToReturn = normalized.length > 0
+      ? normalized
+      : (ALLOW_PLACEHOLDER_QUIZ ? [{
+          question_text: `Quiz: ${t}. (AI service unavailable; returning placeholder question)`,
+          option_a: "Option A",
+          option_b: "Option B",
+          option_c: "Option C",
+          option_d: "Option D",
+          correct_option: "A",
+          explanation: "",
+        }] : []);
+    if (!questionsToReturn.length) {
+      return res.status(503).json({
+        error: "Quiz generation service unavailable. Start AI service or set QUIZ_API_URL.",
+      });
+    }
+    res.json({ questions: questionsToReturn });
+  } catch (err) {
+    console.error("POST /generate_quiz error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
 app.post("/api/live-quiz", async (req, res) => {
   const db = getPool();
   const { teacherId, classId, chapterId, topicId, topicName, subjectId, liveSessionId } = req.body || {};
@@ -1347,6 +2138,7 @@ app.post("/api/live-quiz", async (req, res) => {
     return res.status(400).json({ error: "teacherId, classId, chapterId, topicId, topicName, subjectId are required" });
   }
   try {
+    liveQuizCheckpoint("POST /api/live-quiz:request", { teacherId, classId, subjectId, topicId, liveSessionId });
     const liveSessionIdNum = liveSessionId != null ? Number(liveSessionId) : null;
     // One quiz per live session: if liveSessionId provided, return existing active quiz for this session
     if (liveSessionIdNum != null) {
@@ -1357,6 +2149,7 @@ app.post("/api/live-quiz", async (req, res) => {
         );
         if (existing && existing.length > 0) {
           const sessionId = existing[0].id;
+          liveQuizCheckpoint("POST /api/live-quiz:reuse_existing_active", { liveQuizSessionId: sessionId, liveSessionId: liveSessionIdNum });
           const [qRows] = await db.query(
             "SELECT id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num FROM live_quiz_questions WHERE live_quiz_session_id = ? ORDER BY order_num",
             [sessionId]
@@ -1389,8 +2182,25 @@ app.post("/api/live-quiz", async (req, res) => {
 
     const subjectRow = await db.query("SELECT name FROM subjects WHERE id = ?", [Number(subjectId)]).then(([r]) => r && r[0]).catch(() => null);
     const subjectName = subjectRow ? subjectRow.name : "Subject";
-    const questions = await fetchQuizQuestions(topicName, subjectName, 10);
-    const numQuestionsToCreate = Math.max(questions.length, 1);
+    const questions = await fetchQuizQuestions(topicName, subjectName, 10, { topicId, chapterId, subjectId });
+    const fallbackQuestions = Array.from({ length: 10 }).map((_, i) => ({
+      question_text: `Question ${i + 1}: ${String(topicName)} (generated fallback)`,
+      option_a: "A",
+      option_b: "B",
+      option_c: "C",
+      option_d: "D",
+      correct_option: "A",
+      explanation: "",
+    }));
+    const questionsToCreate = questions.length >= 10
+      ? questions.slice(0, 10)
+      : (ALLOW_PLACEHOLDER_QUIZ ? [...questions, ...fallbackQuestions].slice(0, 10) : questions.slice(0, 10));
+    if (questionsToCreate.length < 10) {
+      return res.status(503).json({
+        error: "Unable to generate full quiz right now. Please retry after AI service is ready.",
+      });
+    }
+    const numQuestionsToCreate = 10;
     let sessionId;
     if (liveSessionIdNum != null) {
       try {
@@ -1414,7 +2224,7 @@ app.post("/api/live-quiz", async (req, res) => {
       return res.status(500).json({ error: "Failed to create quiz session. Ensure live_quiz_sessions table exists." });
     }
     for (let i = 0; i < numQuestionsToCreate; i++) {
-      const q = questions[i] || {};
+      const q = questionsToCreate[i] || {};
       try {
         await db.query(
           "INSERT INTO live_quiz_questions (live_quiz_session_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, order_num) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1453,20 +2263,28 @@ app.post("/api/live-quiz", async (req, res) => {
       explanation: q.explanation || "",
       orderNum: q.order_num,
     }));
-    // Ensure we always return at least one question so the UI shows the quiz (e.g. if table missing or INSERT failed)
+    // In strict mode we fail instead of returning placeholder questions, so production doesn't hide generation failures.
     const questionsToReturn = mappedQuestions.length > 0
       ? mappedQuestions
-      : [{
-          id: "placeholder-1",
-          questionText: `Quiz: ${topicName}. Add live_quiz_questions table if you see only this.`,
-          optionA: "Option A",
-          optionB: "Option B",
-          optionC: "Option C",
-          optionD: "Option D",
-          correctOption: "A",
-          explanation: "",
-          orderNum: 0,
-        }];
+      : (ALLOW_PLACEHOLDER_QUIZ ? fallbackQuestions.map((q, idx) => ({
+          id: `placeholder-${idx + 1}`,
+          questionText: q.question_text,
+          optionA: q.option_a,
+          optionB: q.option_b,
+          optionC: q.option_c,
+          optionD: q.option_d,
+          correctOption: q.correct_option,
+          explanation: q.explanation,
+          orderNum: idx,
+        })) : []);
+    if (!questionsToReturn.length) {
+      return res.status(500).json({ error: "Quiz was created but no questions were saved. Check database tables and AI service." });
+    }
+    liveQuizCheckpoint("POST /api/live-quiz:created_new", {
+      liveQuizSessionId: sessionId,
+      liveSessionId: liveSessionIdNum,
+      questionCount: questionsToReturn.length,
+    });
     res.status(201).json({
       id: String(sessionId),
       teacherId: String(teacherId),
@@ -1533,6 +2351,128 @@ app.get("/api/live-quiz/:id", async (req, res) => {
   }
 });
 
+app.get("/api/live-quiz/:id/teacher-qr", async (req, res) => {
+  const sessionId = Number(req.params.id);
+  if (!sessionId) return res.status(400).json({ error: "id required" });
+  try {
+    const token = `LQ|${sessionId}|${Date.now()}`;
+    const payloadUrl = `${getPublicApiBase(req)}/live-quiz-scan?session=${encodeURIComponent(String(sessionId))}`;
+    const dataUrl = await QRCode.toDataURL(payloadUrl, { margin: 1, width: 220 });
+    liveQuizCheckpoint("GET /api/live-quiz/:id/teacher-qr", {
+      sessionId,
+      qrBaseUrlEnv: (process.env.QR_BASE_URL || "").trim() || "(none — using host/LAN)",
+      payloadUrl,
+    });
+    res.json({ sessionId: String(sessionId), token, payloadUrl, dataUrl });
+  } catch (err) {
+    console.error("GET /api/live-quiz/:id/teacher-qr error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.post("/api/live-quiz/:id/connect", async (req, res) => {
+  const sessionId = Number(req.params.id);
+  const { deviceId } = req.body || {};
+  if (!sessionId || !deviceId) return res.status(400).json({ error: "deviceId required" });
+  const now = Date.now();
+  const state = getRuntimeState(sessionId);
+  state.connectedDevices[String(deviceId)] = now;
+  liveQuizRuntime.set(sessionId, state);
+  liveQuizCheckpoint("POST /api/live-quiz/:id/connect", {
+    sessionId,
+    deviceIdPrefix: String(deviceId).slice(0, 24),
+    connectedDevices: Object.keys(state.connectedDevices).length,
+    started: Boolean(state.started),
+  });
+  res.json({ ok: true, sessionId: String(sessionId), connectedDevices: Object.keys(state.connectedDevices).length, started: Boolean(state.started) });
+});
+
+app.get("/api/live-quiz/:id/status", async (req, res) => {
+  const db = getPool();
+  const sessionId = Number(req.params.id);
+  if (!sessionId) return res.status(400).json({ error: "id required" });
+  try {
+    const [sessionRows] = await db.query("SELECT class_id, live_session_id FROM live_quiz_sessions WHERE id = ? LIMIT 1", [sessionId]);
+    if (!Array.isArray(sessionRows) || !sessionRows[0]) return res.status(404).json({ error: "Session not found" });
+    const classId = Number(sessionRows[0].class_id);
+    const liveSessionId = sessionRows[0].live_session_id != null ? Number(sessionRows[0].live_session_id) : null;
+    let sessionDate = null;
+    let liveAttendanceMarked = !liveSessionId;
+    if (liveSessionId) {
+      const [lsRows] = await db.query("SELECT session_date, attendance_marked FROM live_sessions WHERE id = ? LIMIT 1", [liveSessionId]);
+      if (Array.isArray(lsRows) && lsRows[0]) {
+        sessionDate = lsRows[0].session_date ? toDateKey(lsRows[0].session_date) : null;
+        liveAttendanceMarked = Boolean(Number(lsRows[0].attendance_marked));
+      }
+    }
+    const attendanceDate = await getQuizAttendanceDate(db, classId, liveSessionId, sessionDate || new Date().toISOString().slice(0, 10));
+    const [presentRows] = await db.query(
+      "SELECT COUNT(*) AS c FROM attendance WHERE class_id = ? AND date = ? AND status = 'present'",
+      [classId, attendanceDate]
+    );
+    const presentCount = Number(presentRows?.[0]?.c || 0);
+    const [qRows] = await db.query("SELECT COUNT(*) AS c FROM live_quiz_questions WHERE live_quiz_session_id = ?", [sessionId]);
+    const [aRows] = await db.query("SELECT COUNT(*) AS c FROM live_quiz_answers WHERE live_quiz_session_id = ?", [sessionId]);
+    const state = getRuntimeState(sessionId);
+    const progressByQuestion = state.progressByQuestion || {};
+    const payload = {
+      sessionId: String(sessionId),
+      started: Boolean(state.started),
+      connectedDevices: Object.keys(state.connectedDevices || {}).length,
+      questions: Number(qRows?.[0]?.c || 0),
+      students: presentCount,
+      answersCaptured: Number(aRows?.[0]?.c || 0),
+      attendanceReady: liveAttendanceMarked && presentCount > 0,
+      attendanceDate,
+      currentQuestionNo: Number(state.currentQuestionNo || 1),
+      progressByQuestion,
+      submitted: Boolean(state.submitted),
+    };
+    const logN = (liveQuizStatusLogSeq.get(sessionId) || 0) + 1;
+    liveQuizStatusLogSeq.set(sessionId, logN);
+    if (logN === 1 || logN % 8 === 0) {
+      liveQuizCheckpoint("GET /api/live-quiz/:id/status", {
+        logN,
+        classId,
+        liveSessionId,
+        sessionDateFromLive: sessionDate,
+        attendanceMarkedFromDb: liveAttendanceMarked,
+        presentCount,
+        attendanceDateUsed: attendanceDate,
+        ...payload,
+      });
+    }
+    res.json(payload);
+  } catch (err) {
+    console.error("GET /api/live-quiz/:id/status error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.post("/api/live-quiz/:id/start-capture", async (req, res) => {
+  const sessionId = Number(req.params.id);
+  if (!sessionId) return res.status(400).json({ error: "id required" });
+  const state = getRuntimeState(sessionId);
+  state.started = true;
+  state.currentQuestionNo = 1;
+  state.progressByQuestion = {};
+  state.submitted = false;
+  liveQuizRuntime.set(sessionId, state);
+  liveQuizCheckpoint("POST /api/live-quiz/:id/start-capture", { sessionId, runtime: state });
+  res.json({ ok: true, sessionId: String(sessionId), started: true });
+});
+
+app.post("/api/live-quiz/:id/progress", async (req, res) => {
+  const sessionId = Number(req.params.id);
+  const { questionNo, scannedCount } = req.body || {};
+  if (!sessionId || !questionNo || scannedCount == null) return res.status(400).json({ error: "questionNo and scannedCount required" });
+  const state = getRuntimeState(sessionId);
+  state.progressByQuestion[String(Number(questionNo))] = Number(scannedCount) || 0;
+  if (Number(questionNo) > Number(state.currentQuestionNo || 1)) state.currentQuestionNo = Number(questionNo);
+  liveQuizRuntime.set(sessionId, state);
+  res.json({ ok: true, sessionId: String(sessionId), currentQuestionNo: state.currentQuestionNo, progressByQuestion: state.progressByQuestion });
+});
+
 app.post("/api/live-quiz/:id/answer", async (req, res) => {
   const db = getPool();
   const sessionId = Number(req.params.id);
@@ -1559,6 +2499,584 @@ app.post("/api/live-quiz/:id/answer", async (req, res) => {
   }
 });
 
+app.post("/api/live-quiz/:id/scan", async (req, res) => {
+  const db = getPool();
+  const sessionId = Number(req.params.id);
+  const { questionNo, qrRaw } = req.body || {};
+  if (!sessionId || !questionNo || !qrRaw) {
+    liveQuizCheckpoint("POST /api/live-quiz/:id/scan:reject", { reason: "missing_fields", sessionId });
+    return res.status(400).json({ error: "questionNo and qrRaw are required" });
+  }
+  try {
+    liveQuizCheckpoint("POST /api/live-quiz/:id/scan:incoming", {
+      sessionId,
+      questionNo,
+      qrRaw: String(qrRaw).slice(0, 48),
+    });
+    const runtimeState = getRuntimeState(sessionId);
+    if (!runtimeState.started) {
+      liveQuizCheckpoint("POST /api/live-quiz/:id/scan:reject", { reason: "capture_not_started", sessionId });
+      return res.status(400).json({ error: "Quiz capture has not started yet" });
+    }
+    const qNo = Number(questionNo);
+    if (!qNo || qNo < 1) return res.status(400).json({ error: "questionNo must be >= 1" });
+    const raw = String(qrRaw).trim().toUpperCase();
+    const m = raw.match(/^(?:STU)?([0-9]+)_([A-D])$/);
+    if (!m) {
+      liveQuizCheckpoint("POST /api/live-quiz/:id/scan:reject", { reason: "invalid_qr_format", raw: raw.slice(0, 32) });
+      return res.status(400).json({ error: "Invalid QR format. Expected <ROLL_NUMBER>_<A|B|C|D>" });
+    }
+    const rollNo = Number(m[1]);
+    const selectedOption = m[2];
+    const [sessionRows] = await db.query("SELECT id, class_id, status FROM live_quiz_sessions WHERE id = ? LIMIT 1", [sessionId]);
+    const session = Array.isArray(sessionRows) && sessionRows[0] ? sessionRows[0] : null;
+    if (!session) return res.status(404).json({ error: "Live quiz session not found" });
+    if (String(session.status || "").toLowerCase() !== "active") return res.status(400).json({ error: "Session is not active" });
+    const [questionRows] = await db.query(
+      "SELECT id, correct_option FROM live_quiz_questions WHERE live_quiz_session_id = ? ORDER BY order_num, id",
+      [sessionId]
+    );
+    const qIndex = qNo - 1;
+    const question = Array.isArray(questionRows) && questionRows[qIndex] ? questionRows[qIndex] : null;
+    if (!question) return res.status(400).json({ error: `Question ${qNo} not found in this session` });
+    const [studentRows] = await db.query(
+      "SELECT id, first_name, last_name FROM students WHERE section_id = ? AND roll_no = ? LIMIT 1",
+      [Number(session.class_id), rollNo]
+    );
+    const student = Array.isArray(studentRows) && studentRows[0] ? studentRows[0] : null;
+    if (!student) return res.status(404).json({ error: "Student not found for this class and roll number" });
+    const [liveSessionLinkRows] = await db.query("SELECT live_session_id FROM live_quiz_sessions WHERE id = ? LIMIT 1", [sessionId]);
+    const liveSessionId = Array.isArray(liveSessionLinkRows) && liveSessionLinkRows[0] && liveSessionLinkRows[0].live_session_id != null
+      ? Number(liveSessionLinkRows[0].live_session_id)
+      : null;
+    let sessionDate = new Date().toISOString().slice(0, 10);
+    if (liveSessionId) {
+      const [lsRows] = await db.query("SELECT session_date FROM live_sessions WHERE id = ? LIMIT 1", [liveSessionId]);
+      if (Array.isArray(lsRows) && lsRows[0] && lsRows[0].session_date) {
+        sessionDate = toDateKey(lsRows[0].session_date);
+      }
+    }
+    const attendanceDate = await getQuizAttendanceDate(db, Number(session.class_id), liveSessionId, sessionDate);
+    const [attRows] = await db.query(
+      "SELECT status FROM attendance WHERE class_id = ? AND student_id = ? AND date = ? LIMIT 1",
+      [Number(session.class_id), Number(student.id), attendanceDate]
+    );
+    if (!Array.isArray(attRows) || !attRows[0]) {
+      liveQuizCheckpoint("POST /api/live-quiz/:id/scan:reject", {
+        reason: "no_attendance_row",
+        classId: Number(session.class_id),
+        studentId: Number(student.id),
+        attendanceDate,
+        rollNo,
+      });
+      return res.status(400).json({ error: "Attendance not found for student on this session date" });
+    }
+    if (String(attRows[0].status || "").toLowerCase() !== "present") {
+      liveQuizCheckpoint("POST /api/live-quiz/:id/scan:reject", { reason: "student_absent", studentId: Number(student.id), attendanceDate });
+      return res.status(400).json({ error: "Student is absent and not eligible for quiz today" });
+    }
+    const [dupRows] = await db.query(
+      "SELECT id FROM live_quiz_answers WHERE live_quiz_session_id = ? AND question_id = ? AND student_id = ? LIMIT 1",
+      [sessionId, Number(question.id), Number(student.id)]
+    );
+    if (Array.isArray(dupRows) && dupRows[0]) {
+      liveQuizCheckpoint("POST /api/live-quiz/:id/scan:reject", { reason: "duplicate", studentId: Number(student.id), questionNo: qNo });
+      return res.status(409).json({ error: "Duplicate scan for this student/question", duplicate: true });
+    }
+    const correctOption = String(question.correct_option || "A").toUpperCase().charAt(0);
+    const isCorrect = selectedOption === correctOption ? 1 : 0;
+    await db.query(
+      "INSERT INTO live_quiz_answers (live_quiz_session_id, student_id, question_id, selected_option, is_correct) VALUES (?, ?, ?, ?, ?)",
+      [sessionId, Number(student.id), Number(question.id), selectedOption, isCorrect]
+    );
+    const studentName = [student.first_name, student.last_name].filter(Boolean).join(" ").trim() || `Student ${student.id}`;
+    liveQuizCheckpoint("POST /api/live-quiz/:id/scan:ok", {
+      sessionId,
+      questionNo: qNo,
+      studentId: Number(student.id),
+      rollNo,
+      attendanceDate,
+      selectedOption,
+      isCorrect: isCorrect === 1,
+    });
+    res.json({
+      ok: true,
+      sessionId: String(sessionId),
+      questionNo: qNo,
+      studentId: String(student.id),
+      studentName,
+      rollNo: String(rollNo),
+      selectedOption,
+      isCorrect: isCorrect === 1,
+      confirmation: `${studentName} selected ${selectedOption}`,
+    });
+  } catch (err) {
+    liveQuizCheckpoint("POST /api/live-quiz/:id/scan:error", { message: String(err && err.message) });
+    console.error("POST /api/live-quiz/:id/scan error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.post("/api/live-quiz/:id/submit-bulk", async (req, res) => {
+  const db = getPool();
+  const sessionId = Number(req.params.id);
+  const { responses } = req.body || {};
+  if (!sessionId || !Array.isArray(responses) || responses.length === 0) {
+    liveQuizCheckpoint("POST /api/live-quiz/:id/submit-bulk:reject", { reason: "no_responses", sessionId });
+    return res.status(400).json({ error: "responses array required" });
+  }
+  try {
+    liveQuizCheckpoint("POST /api/live-quiz/:id/submit-bulk:incoming", { sessionId, responseCount: responses.length });
+    const runtimeState = getRuntimeState(sessionId);
+    if (!runtimeState.started) {
+      liveQuizCheckpoint("POST /api/live-quiz/:id/submit-bulk:reject", { reason: "capture_not_started", sessionId });
+      return res.status(400).json({ error: "Capture has not started yet" });
+    }
+
+    const [sessionRows] = await db.query("SELECT id, class_id, live_session_id, status FROM live_quiz_sessions WHERE id = ? LIMIT 1", [sessionId]);
+    const session = Array.isArray(sessionRows) && sessionRows[0] ? sessionRows[0] : null;
+    if (!session) return res.status(404).json({ error: "Live quiz session not found" });
+    if (String(session.status || "").toLowerCase() !== "active") return res.status(400).json({ error: "Session is not active" });
+    const [questionRows] = await db.query(
+      "SELECT id, order_num, correct_option FROM live_quiz_questions WHERE live_quiz_session_id = ? ORDER BY order_num, id",
+      [sessionId]
+    );
+    const totalQuestions = Array.isArray(questionRows) ? questionRows.length : 0;
+    if (totalQuestions < 1) return res.status(400).json({ error: "No quiz questions found" });
+    let sessionDate = new Date().toISOString().slice(0, 10);
+    if (session.live_session_id != null) {
+      const [lsRows] = await db.query("SELECT session_date FROM live_sessions WHERE id = ? LIMIT 1", [Number(session.live_session_id)]);
+      if (Array.isArray(lsRows) && lsRows[0] && lsRows[0].session_date) sessionDate = toDateKey(lsRows[0].session_date);
+    }
+    const attendanceDate = await getQuizAttendanceDate(
+      db,
+      Number(session.class_id),
+      session.live_session_id != null ? Number(session.live_session_id) : null,
+      sessionDate
+    );
+    const [presentRows] = await db.query(
+      "SELECT student_id FROM attendance WHERE class_id = ? AND date = ? AND status = 'present'",
+      [Number(session.class_id), attendanceDate]
+    );
+    const presentSet = new Set((presentRows || []).map((r) => Number(r.student_id)));
+    if (presentSet.size < 1) return res.status(400).json({ error: "No present students found for this session date" });
+    const [classStudentsRows] = await db.query("SELECT id, roll_no FROM students WHERE section_id = ?", [Number(session.class_id)]);
+    const rollToStudent = new Map();
+    (classStudentsRows || []).forEach((r) => {
+      if (r.roll_no != null) rollToStudent.set(String(r.roll_no), Number(r.id));
+    });
+    const answersByQuestion = {};
+    const normalized = [];
+    for (const item of responses) {
+      const questionNo = Number(item?.questionNo);
+      const qrRaw = String(item?.qrRaw || "").trim().toUpperCase();
+      if (!questionNo || questionNo < 1 || questionNo > totalQuestions) return res.status(400).json({ error: `Invalid questionNo in payload: ${questionNo}` });
+      const m = qrRaw.match(/^(?:STU)?([0-9]+)_([A-D])$/);
+      if (!m) return res.status(400).json({ error: `Invalid QR format: ${qrRaw}` });
+      const rollNo = m[1];
+      const selectedOption = m[2];
+      const studentId = rollToStudent.get(rollNo);
+      if (!studentId) return res.status(400).json({ error: `Student not found for roll no ${rollNo}` });
+      if (!presentSet.has(studentId)) return res.status(400).json({ error: `Absent student not eligible: roll ${rollNo}` });
+      if (!answersByQuestion[questionNo]) answersByQuestion[questionNo] = new Set();
+      if (answersByQuestion[questionNo].has(studentId)) return res.status(400).json({ error: `Duplicate scan for question ${questionNo}, roll ${rollNo}` });
+      answersByQuestion[questionNo].add(studentId);
+      normalized.push({ questionNo, studentId, selectedOption });
+    }
+    for (let q = 1; q <= totalQuestions; q++) {
+      const count = answersByQuestion[q] ? answersByQuestion[q].size : 0;
+      if (count !== presentSet.size) {
+        return res.status(400).json({ error: `Question ${q} has ${count}/${presentSet.size} scans. Complete all present students first.` });
+      }
+    }
+    const qByNo = {};
+    (questionRows || []).forEach((q, idx) => {
+      qByNo[idx + 1] = { id: Number(q.id), correctOption: String(q.correct_option || "A").toUpperCase().charAt(0) };
+    });
+    for (const a of normalized) {
+      const q = qByNo[a.questionNo];
+      const isCorrect = a.selectedOption === q.correctOption ? 1 : 0;
+      await db.query(
+        "INSERT INTO live_quiz_answers (live_quiz_session_id, student_id, question_id, selected_option, is_correct) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE selected_option = VALUES(selected_option), is_correct = VALUES(is_correct)",
+        [sessionId, a.studentId, q.id, a.selectedOption, isCorrect]
+      );
+    }
+    // Final submit means quiz is complete: close quiz + sync marks immediately.
+    await db.query("UPDATE live_quiz_sessions SET status = 'ended' WHERE id = ?", [sessionId]);
+    await upsertStudentMarksFromLiveQuizSession(db, sessionId);
+    const state = getRuntimeState(sessionId);
+    state.submitted = true;
+    state.started = false;
+    state.progressByQuestion = {};
+    state.currentQuestionNo = totalQuestions;
+    liveQuizRuntime.set(sessionId, state);
+    const [leaderRows] = await db.query(
+      "SELECT student_id, SUM(is_correct) AS score FROM live_quiz_answers WHERE live_quiz_session_id = ? GROUP BY student_id ORDER BY score DESC",
+      [sessionId]
+    );
+    liveQuizCheckpoint("POST /api/live-quiz/:id/submit-bulk:ok", {
+      sessionId,
+      savedRows: normalized.length,
+      totalQuestions,
+      presentStudents: presentSet.size,
+      attendanceDate,
+    });
+    res.json({
+      ok: true,
+      sessionId: String(sessionId),
+      saved: normalized.length,
+      questions: totalQuestions,
+      presentStudents: presentSet.size,
+      autoEnded: true,
+      leaderboard: (leaderRows || []).map((r) => ({ studentId: String(r.student_id), score: Number(r.score || 0) })),
+    });
+  } catch (err) {
+    liveQuizCheckpoint("POST /api/live-quiz/:id/submit-bulk:error", { message: String(err && err.message) });
+    console.error("POST /api/live-quiz/:id/submit-bulk error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.get("/live-quiz-scan", (req, res) => {
+  const session = String(req.query.session || "").trim();
+  if (!session) {
+    return res.status(400).send("session query param required");
+  }
+  liveQuizCheckpoint("GET /live-quiz-scan:page", { sessionId: session, userAgent: String(req.headers["user-agent"] || "").slice(0, 120) });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Live Quiz Scanner</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; padding: 16px; background: #f7fafc; color: #111827; }
+      .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+      input, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #d1d5db; font-size: 14px; box-sizing: border-box; }
+      button { background: #0f766e; color: #fff; border: 0; margin-top: 10px; }
+      .muted { color: #6b7280; font-size: 12px; }
+      .ok { color: #166534; font-size: 13px; margin-top: 6px; }
+      .err { color: #b91c1c; font-size: 13px; margin-top: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <b>Live Quiz Scanner</b>
+      <div class="muted">Session: ${session}</div>
+      <div class="muted" id="status">Connecting...</div>
+    </div>
+    <div class="card">
+      <b>Camera QR Capture</b>
+      <div class="muted">Tap Start Camera, then scan student answer QR directly.</div>
+      <video id="video" style="width:100%; border-radius:8px; background:#000; margin-top:10px;" playsinline></video>
+      <button id="startCamBtn">Start camera</button>
+      <button id="stopCamBtn" style="background:#6b7280;">Stop camera</button>
+    </div>
+    <div class="card">
+      <label class="muted">Question number</label>
+      <input id="qno" type="number" min="1" value="1" />
+      <label class="muted" style="margin-top:8px;display:block;">Scanned value (ROLLNO_OPTION)</label>
+      <input id="qr" placeholder="2601100001_B" />
+      <button id="submitBtn">Submit scan</button>
+      <button id="nextBtn" style="background:#2563eb;">Next question</button>
+      <button id="finalBtn" style="background:#059669;">Submit all answers to server</button>
+      <div id="msg" class="muted"></div>
+    </div>
+    <script>
+      function lqCheckpoint(name, data) {
+        console.log("[LIVE_QUIZ_CHECK] [mobile_scanner]", name, data !== undefined ? data : "");
+      }
+      const sessionId = ${JSON.stringify(session)};
+      lqCheckpoint("page_loaded", { sessionId, href: String(typeof location !== "undefined" ? location.href : "") });
+      const deviceIdKey = "liveQuizDeviceId";
+      let deviceId = localStorage.getItem(deviceIdKey);
+      if (!deviceId) {
+        deviceId = "dev_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+        localStorage.setItem(deviceIdKey, deviceId);
+      }
+      const bufferKey = "liveQuizBuffer_" + sessionId;
+      let bufferedResponses = [];
+      try { bufferedResponses = JSON.parse(localStorage.getItem(bufferKey) || "[]"); } catch (_) { bufferedResponses = []; }
+      let expectedPerQuestion = 0;
+      let totalQuestions = 10;
+      let runtimeStarted = false;
+      let runtimeAttendanceReady = false;
+      let statusPollSeq = 0;
+      function qnoValue() { return Number(document.getElementById("qno").value || "1"); }
+
+      function parseStudentQr(raw) {
+        const upper = String(raw || "").trim().toUpperCase();
+        // Accept both "ROLLNO_OPTION" and legacy "stuROLLNO_OPTION"
+        const m = upper.match(/^(?:STU)?([0-9]+)_([A-D])$/);
+        if (!m) return null;
+        return { rollNo: m[1], selectedOption: m[2] };
+      }
+      function currentCountForQuestion(q) {
+        const set = new Set();
+        bufferedResponses.forEach(r => {
+          if (Number(r.questionNo) === Number(q)) {
+            const parsed = parseStudentQr(r.qrRaw);
+            if (parsed) set.add(parsed.rollNo);
+          }
+        });
+        return set.size;
+      }
+      function saveBuffer() {
+        localStorage.setItem(bufferKey, JSON.stringify(bufferedResponses));
+      }
+      async function pushProgress() {
+        const q = qnoValue();
+        const scannedCount = currentCountForQuestion(q);
+        try {
+          await fetch("/api/live-quiz/" + encodeURIComponent(sessionId) + "/progress", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ questionNo: q, scannedCount }),
+          });
+        } catch (_) {}
+      }
+      async function connect() {
+        try {
+          const cr = await fetch("/api/live-quiz/" + encodeURIComponent(sessionId) + "/connect", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ deviceId }),
+          });
+          const cj = await cr.json().catch(() => ({}));
+          lqCheckpoint("connect", { ok: cr.ok, connectedDevices: cj.connectedDevices, started: cj.started });
+        } catch (e) {
+          lqCheckpoint("connect_error", { message: e && e.message ? e.message : String(e) });
+        }
+      }
+      async function refreshStatus() {
+        try {
+          const r = await fetch("/api/live-quiz/" + encodeURIComponent(sessionId) + "/status");
+          const s = await r.json();
+          statusPollSeq += 1;
+          if (statusPollSeq === 1 || statusPollSeq % 5 === 0) {
+            lqCheckpoint("poll_status", {
+              pollSeq: statusPollSeq,
+              httpOk: r.ok,
+              students: s.students,
+              questions: s.questions,
+              attendanceReady: s.attendanceReady,
+              attendanceDate: s.attendanceDate,
+              answersCaptured: s.answersCaptured,
+              started: s.started,
+              submitted: s.submitted,
+            });
+          }
+          expectedPerQuestion = Number(s.students || 0);
+          totalQuestions = Number(s.questions || 10);
+          runtimeStarted = Boolean(s.started);
+          runtimeAttendanceReady = Boolean(s.attendanceReady);
+          const st = document.getElementById("status");
+          const q = qnoValue();
+          const qCount = currentCountForQuestion(q);
+          st.textContent = "Connected devices: " + (s.connectedDevices || 0) + " | Capture: " + (s.started ? "Started" : "Waiting") + " | Q" + q + ": " + qCount + "/" + expectedPerQuestion + " | DB captured: " + (s.answersCaptured || 0);
+          const nextBtn = document.getElementById("nextBtn");
+          // Allow moving to next question during capture; final submit still enforces full completion.
+          const canMoveNext = q < totalQuestions;
+          nextBtn.disabled = !canMoveNext;
+          const finalBtn = document.getElementById("finalBtn");
+          const allComplete = (() => {
+            if (expectedPerQuestion < 1) return false;
+            for (let i = 1; i <= totalQuestions; i++) {
+              if (currentCountForQuestion(i) !== expectedPerQuestion) return false;
+            }
+            return true;
+          })();
+          finalBtn.disabled = !allComplete;
+        } catch (_) {}
+      }
+
+      const msgEl = document.getElementById("msg");
+      async function bufferQr(qno, qrRaw) {
+        if (!runtimeStarted) throw new Error("Teacher hasn't started capture yet.");
+        if (!runtimeAttendanceReady) throw new Error("Attendance is not ready yet for eligible students.");
+        const upper = String(qrRaw || "").trim().toUpperCase();
+        if (!upper) throw new Error("Empty QR");
+        const parsed = parseStudentQr(upper);
+        if (!parsed) throw new Error("Invalid format. Use ROLLNO_OPTION, e.g. 2601100001_B");
+        const exists = bufferedResponses.some((r) => Number(r.questionNo) === Number(qno) && parseStudentQr(r.qrRaw)?.rollNo === parsed.rollNo);
+        if (exists) throw new Error("Duplicate scan for this question (roll already captured)");
+
+        // Write immediately to DB so teacher progress updates live.
+        const scanRes = await fetch("/api/live-quiz/" + encodeURIComponent(sessionId) + "/scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ questionNo: qno, qrRaw: upper }),
+        });
+        const data = await scanRes.json().catch(() => ({}));
+        if (!scanRes.ok) {
+          lqCheckpoint("scan_http_fail", { status: scanRes.status, error: data && data.error, qno, upper: upper.slice(0, 32) });
+          throw new Error((data && data.error) ? data.error : "Scan failed");
+        }
+        lqCheckpoint("scan_ok", { qno, roll: parsed.rollNo, option: parsed.selectedOption, confirmation: data && data.confirmation });
+
+        bufferedResponses.push({ questionNo: qno, qrRaw: upper });
+        saveBuffer();
+        msgEl.className = "ok";
+        msgEl.textContent = (data && data.confirmation) ? data.confirmation : ("Saved: " + upper);
+        refreshStatus();
+      }
+      // Camera QR capture (no manual typing). Uses native BarcodeDetector when available.
+      let detector = null;
+      let cameraRunning = false;
+      let cameraStream = null;
+      let lastAutoRaw = "";
+      let lastAutoAt = 0;
+
+      async function startCamera() {
+        if (cameraRunning) return;
+        const video = document.getElementById("video");
+        if (!video) return;
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          msgEl.className = "err";
+          msgEl.textContent = "Camera not supported on this browser.";
+          return;
+        }
+        if (!("BarcodeDetector" in window)) {
+          msgEl.className = "err";
+          msgEl.textContent = "QR scanning requires BarcodeDetector support in this browser.";
+          return;
+        }
+        detector = new BarcodeDetector({ formats: ["qr_code"] });
+        cameraRunning = true;
+        try {
+          cameraStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment" },
+            audio: false,
+          });
+          video.srcObject = cameraStream;
+          await video.play();
+        } catch (e) {
+          cameraRunning = false;
+          msgEl.className = "err";
+          msgEl.textContent = e && e.message ? e.message : "Camera permission denied";
+          return;
+        }
+
+        const scanFrame = async () => {
+          if (!cameraRunning) return;
+          const v = document.getElementById("video");
+          if (!v || v.readyState < 2) {
+            setTimeout(scanFrame, 250);
+            return;
+          }
+          try {
+            const barcodes = await detector.detect(v);
+            if (barcodes && barcodes.length > 0) {
+              const raw = barcodes[0].rawValue;
+              const now = Date.now();
+              if (raw && (raw !== lastAutoRaw || (now - lastAutoAt) > 1500)) {
+                lastAutoRaw = raw;
+                lastAutoAt = now;
+                const parsed = parseStudentQr(raw);
+                if (parsed) {
+                  try {
+                    await bufferQr(qnoValue(), raw);
+                    document.getElementById("qr").value = "";
+                  } catch (e) {
+                    // duplicates / not started are normal; don't spam
+                    msgEl.className = "muted";
+                    msgEl.textContent = e && e.message ? e.message : "Scan ignored";
+                  }
+                } else {
+                  msgEl.className = "muted";
+                  msgEl.textContent = "Scanned invalid QR";
+                }
+              }
+            }
+          } catch (_) {}
+          setTimeout(scanFrame, 250);
+        };
+
+        scanFrame();
+      }
+
+      function stopCamera() {
+        cameraRunning = false;
+        try {
+          if (cameraStream) cameraStream.getTracks().forEach((t) => t.stop());
+        } catch (_) {}
+        cameraStream = null;
+        const video = document.getElementById("video");
+        if (video) video.srcObject = null;
+      }
+
+      document.getElementById("startCamBtn")?.addEventListener("click", () => {
+        startCamera().catch(() => {});
+      });
+      document.getElementById("stopCamBtn")?.addEventListener("click", () => {
+        stopCamera();
+      });
+      document.getElementById("submitBtn").addEventListener("click", async () => {
+        const qno = Number(document.getElementById("qno").value || "1");
+        const qrRaw = String(document.getElementById("qr").value || "").trim();
+        if (!qrRaw) return;
+        msgEl.className = "muted";
+        msgEl.textContent = "Buffering...";
+        try {
+          if (!runtimeStarted) throw new Error("Teacher hasn't started capture yet.");
+          if (!runtimeAttendanceReady) throw new Error("Attendance is not ready yet for eligible students.");
+          await bufferQr(qno, qrRaw);
+          document.getElementById("qr").value = "";
+        } catch (e) {
+          msgEl.className = "err";
+          msgEl.textContent = e && e.message ? e.message : "Scan failed";
+        }
+      });
+      document.getElementById("nextBtn").addEventListener("click", async () => {
+        const q = qnoValue();
+        const c = currentCountForQuestion(q);
+        if (expectedPerQuestion > 0 && c !== expectedPerQuestion) {
+          const msg = document.getElementById("msg");
+          msg.className = "muted";
+          msg.textContent = "Q" + q + " incomplete (" + c + "/" + expectedPerQuestion + "). Moving ahead is allowed; final submit will validate all.";
+        }
+        document.getElementById("qno").value = String(Math.min(totalQuestions, q + 1));
+        await pushProgress();
+        refreshStatus();
+      });
+      document.getElementById("finalBtn").addEventListener("click", async () => {
+        const msg = document.getElementById("msg");
+        msg.className = "muted";
+        msg.textContent = "Submitting all answers...";
+        try {
+          const r = await fetch("/api/live-quiz/" + encodeURIComponent(sessionId) + "/submit-bulk", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ responses: bufferedResponses }),
+          });
+          const data = await r.json();
+          if (!r.ok) {
+            lqCheckpoint("submit_bulk_fail", { status: r.status, error: data && data.error });
+            throw new Error(data && data.error ? data.error : "Failed to submit");
+          }
+          lqCheckpoint("submit_bulk_ok", { saved: data.saved, presentStudents: data.presentStudents, questions: data.questions });
+          localStorage.removeItem(bufferKey);
+          bufferedResponses = [];
+          msg.className = "ok";
+          msg.textContent = "Submitted. Teacher can now end quiz and view evaluation.";
+          refreshStatus();
+        } catch (e) {
+          lqCheckpoint("submit_bulk_error", { message: e && e.message ? e.message : String(e) });
+          msg.className = "err";
+          msg.textContent = e && e.message ? e.message : "Failed to submit";
+        }
+      });
+      connect();
+      refreshStatus();
+      // Best-effort auto start; if permission requires user gesture, user can tap Start camera.
+      setTimeout(() => { startCamera().catch(() => {}); }, 800);
+      setInterval(async () => { await connect(); await refreshStatus(); }, 3000);
+    </script>
+  </body>
+</html>`);
+});
+
 app.get("/api/live-quiz/:id/leaderboard", async (req, res) => {
   const db = getPool();
   const sessionId = Number(req.params.id);
@@ -1571,8 +3089,8 @@ app.get("/api/live-quiz/:id/leaderboard", async (req, res) => {
     const studentIds = (rows || []).map((r) => r.student_id).filter(Boolean);
     const names = {};
     if (studentIds.length > 0) {
-      const [students] = await db.query("SELECT id, full_name FROM students WHERE id IN (?)", [studentIds]);
-      (students || []).forEach((s) => { names[s.id] = s.full_name || `Student ${s.id}`; });
+      const [students] = await db.query("SELECT id, first_name, last_name FROM students WHERE id IN (?)", [studentIds]);
+      (students || []).forEach((s) => { names[s.id] = [s.first_name, s.last_name].filter(Boolean).join(" ").trim() || `Student ${s.id}`; });
     }
     res.json({
       leaderboard: (rows || []).map((r, i) => ({
@@ -1632,12 +3150,49 @@ app.put("/api/live-quiz/:id/end", async (req, res) => {
   if (!sessionId) return res.status(400).json({ error: "id required" });
   try {
     await db.query("UPDATE live_quiz_sessions SET status = 'ended' WHERE id = ?", [sessionId]);
+    await upsertStudentMarksFromLiveQuizSession(db, sessionId);
     res.json({ id: String(sessionId), status: "ended" });
   } catch (err) {
     console.error("PUT /api/live-quiz/:id/end error:", err);
     res.status(500).json({ error: String(err.message) });
   }
 });
+
+/**
+ * When starting a new live session for the same teacher + class, end any still-active
+ * rows so the DB never stacks multiple "active" sessions. Ends linked quizzes, clears
+ * in-memory runtime, syncs marks from partial quizzes; leaves attendance_marked / quiz_submitted as-is on the old row.
+ */
+async function closeSupersededLiveSessionsForTeacherClass(db, teacherId, classId) {
+  const tid = Number(teacherId);
+  const cid = Number(classId);
+  if (!tid || !cid) return;
+  liveQuizCheckpoint("live_session_start:supersede_scan", { teacherId: tid, classId: cid });
+  const [sessions] = await db.query(
+    "SELECT id FROM live_sessions WHERE teacher_id = ? AND class_id = ? AND LOWER(COALESCE(status,'')) IN ('active', 'ongoing')",
+    [tid, cid]
+  );
+  for (const row of sessions || []) {
+    const liveSessionId = Number(row.id);
+    try {
+      liveQuizCheckpoint("live_session_start:closing_stale_live_session", { liveSessionId });
+      const [qRows] = await db.query("SELECT id FROM live_quiz_sessions WHERE live_session_id = ?", [liveSessionId]);
+      await db.query("UPDATE live_quiz_sessions SET status = 'ended' WHERE live_session_id = ?", [liveSessionId]);
+      for (const q of qRows || []) {
+        const qid = Number(q.id);
+        liveQuizRuntime.delete(qid);
+        await upsertStudentMarksFromLiveQuizSession(db, qid);
+      }
+      await db.query(
+        "UPDATE live_sessions SET status = 'ended', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [liveSessionId]
+      );
+    } catch (e) {
+      console.error("closeSupersededLiveSessionsForTeacherClass:", e);
+    }
+  }
+  liveQuizCheckpoint("live_session_start:supersede_done", { closedCount: (sessions || []).length });
+}
 
 // --- Live session: start (create row), end (update row) ---
 app.post("/api/live-session/start", async (req, res) => {
@@ -1647,10 +3202,14 @@ app.post("/api/live-session/start", async (req, res) => {
     return res.status(400).json({ error: "teacherId, classId, subjectId, topicName required" });
   }
   try {
+    liveQuizCheckpoint("POST /api/live-session/start:body", { teacherId, classId, subjectId, topicId, topicName });
+    await closeSupersededLiveSessionsForTeacherClass(db, teacherId, classId);
     const startTime = new Date();
+    // Use LOCAL date (not UTC) so frontend attendance submission matches exactly.
+    const sessionDate = `${startTime.getFullYear()}-${String(startTime.getMonth() + 1).padStart(2, "0")}-${String(startTime.getDate()).padStart(2, "0")}`;
     const [result] = await db.query(
-      `INSERT INTO live_sessions (teacher_id, class_id, subject_id, chapter_id, topic_id, topic_name, start_time, status, attendance_marked, quiz_submitted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, 0)`,
+      `INSERT INTO live_sessions (teacher_id, class_id, subject_id, chapter_id, topic_id, topic_name, start_time, session_date, status, attendance_marked, quiz_submitted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 0)`,
       [
         Number(teacherId),
         Number(classId),
@@ -1659,9 +3218,15 @@ app.post("/api/live-session/start", async (req, res) => {
         topicId ? Number(topicId) : null,
         String(topicName),
         startTime,
+        sessionDate,
       ]
     );
     const id = result.insertId;
+    liveQuizCheckpoint("POST /api/live-session/start:created", {
+      liveSessionId: id,
+      sessionDate,
+      classId: Number(classId),
+    });
     res.status(201).json({
       id: String(id),
       teacherId: String(teacherId),
@@ -1686,12 +3251,17 @@ app.put("/api/live-session/:id/end", async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ error: "session id required" });
   try {
+    liveQuizCheckpoint("PUT /api/live-session/:id/end", { liveSessionId: id });
     await db.query(
       `UPDATE live_sessions SET status = 'ended', attendance_marked = 1, quiz_submitted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [id]
     );
     try {
       await db.query("UPDATE live_quiz_sessions SET status = 'ended' WHERE live_session_id = ?", [id]);
+      const [lqRows] = await db.query("SELECT id FROM live_quiz_sessions WHERE live_session_id = ?", [id]);
+      for (const row of lqRows || []) {
+        await upsertStudentMarksFromLiveQuizSession(db, row.id);
+      }
     } catch (_) {}
     res.json({ id: String(id), status: "ended" });
   } catch (err) {
@@ -1703,7 +3273,7 @@ app.put("/api/live-session/:id/end", async (req, res) => {
 // --- Attendance: submit for a class on a date ---
 app.post("/api/attendance", async (req, res) => {
   const db = getPool();
-  const { classId, date, entries } = req.body || {};
+  const { classId, date, entries, liveSessionId } = req.body || {};
   if (!classId || !date || !Array.isArray(entries)) {
     return res.status(400).json({ error: "classId, date, and entries (array of { studentId, status }) required" });
   }
@@ -1720,9 +3290,84 @@ app.post("/api/attendance", async (req, res) => {
         [studentId, classIdNum, dateStr, status]
       );
     }
+    if (liveSessionId != null && String(liveSessionId).trim() !== "") {
+      const lsid = Number(liveSessionId);
+      if (!Number.isNaN(lsid)) {
+        const [u] = await db.query(
+          "UPDATE live_sessions SET attendance_marked = 1, session_date = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+          [dateStr, lsid]
+        );
+        liveQuizCheckpoint("POST /api/attendance:live_session_updated", {
+          liveSessionId: lsid,
+          sessionDate: dateStr,
+          affectedRows: Number(u && u.affectedRows ? u.affectedRows : 0),
+        });
+      }
+    }
+    const presentN = (entries || []).filter((e) => e && e.status === "present").length;
+    const absentN = (entries || []).length - presentN;
+    liveQuizCheckpoint("POST /api/attendance:ok", {
+      classId: classIdNum,
+      date: dateStr,
+      liveSessionId: liveSessionId != null ? String(liveSessionId) : null,
+      entryCount: (entries || []).length,
+      present: presentN,
+      absent: absentN,
+    });
     res.json({ ok: true, date: dateStr, count: entries.length });
   } catch (err) {
     console.error("POST /api/attendance error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+// Chapter-level marks (feeds studentQuizResults on GET /api/all)
+app.post("/api/student-marks", async (req, res) => {
+  const db = getPool();
+  const { studentId, chapterId, score, total, assessedOn, assessmentType, liveQuizSessionId } = req.body || {};
+  const sid = Number(studentId);
+  const cid = Number(chapterId);
+  const sc = Number(score);
+  const tot = Number(total);
+  const lqid = liveQuizSessionId != null && liveQuizSessionId !== "" ? Number(liveQuizSessionId) : null;
+  if (!sid || !cid || Number.isNaN(sc) || Number.isNaN(tot) || tot < 1) {
+    return res.status(400).json({ error: "studentId, chapterId, score, total (total >= 1) required" });
+  }
+  const dateStr = assessedOn ? String(assessedOn).slice(0, 10) : new Date().toISOString().slice(0, 10);
+  const atype = (assessmentType && String(assessmentType).slice(0, 64)) || "assessment";
+  try {
+    const [r] = await db.query(
+      lqid
+        ? "INSERT INTO student_marks (student_id, chapter_id, assessment_type, score, total, assessed_on, live_quiz_session_id) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE score = VALUES(score), total = VALUES(total), assessed_on = VALUES(assessed_on)"
+        : "INSERT INTO student_marks (student_id, chapter_id, assessment_type, score, total, assessed_on) VALUES (?, ?, ?, ?, ?, ?)",
+      lqid
+        ? [sid, cid, atype, Math.min(sc, tot), tot, dateStr, lqid]
+        : [sid, cid, atype, Math.min(sc, tot), tot, dateStr]
+    );
+    res.json({ ok: true, id: r.insertId, studentId: sid, chapterId: cid, score: sc, total: tot, assessedOn: dateStr, liveQuizSessionId: lqid || null });
+  } catch (err) {
+    console.error("POST /api/student-marks error:", err);
+    res.status(500).json({ error: String(err.message) });
+  }
+});
+
+app.get("/api/student-marks", async (req, res) => {
+  const db = getPool();
+  const studentId = req.query.studentId != null ? Number(req.query.studentId) : null;
+  try {
+    if (studentId) {
+      const [rows] = await db.query(
+        "SELECT sm.id, sm.student_id, sm.chapter_id, sm.assessment_type, sm.score, sm.total, sm.assessed_on, sm.live_quiz_session_id, c.chapter_name, s.subject_name FROM student_marks sm JOIN chapters c ON c.id = sm.chapter_id JOIN subjects s ON s.id = c.subject_id WHERE sm.student_id = ? ORDER BY sm.assessed_on DESC, sm.id DESC",
+        [studentId]
+      );
+      return res.json({ marks: rows });
+    }
+    const [rows] = await db.query(
+      "SELECT sm.id, sm.student_id, sm.chapter_id, sm.assessment_type, sm.score, sm.total, sm.assessed_on, sm.live_quiz_session_id FROM student_marks sm ORDER BY sm.student_id, sm.assessed_on DESC LIMIT 5000"
+    );
+    res.json({ marks: rows });
+  } catch (err) {
+    console.error("GET /api/student-marks error:", err);
     res.status(500).json({ error: String(err.message) });
   }
 });
@@ -1738,13 +3383,24 @@ app.put("/api/chapters/:id/textbook", async (req, res) => {
     if (base64File && typeof base64File === "string") {
       const ext = filename && /\.(pdf|pptx?)$/i.test(filename) ? path.extname(filename).toLowerCase() : ".pdf";
       const safeName = `chapter_${chapterId}${ext}`;
-      const absolutePath = path.join(textbookDir, safeName);
       const buf = Buffer.from(base64File, "base64");
-      fs.writeFileSync(absolutePath, buf);
       relativePath = path.join("textbook", safeName).replace(/\\/g, "/");
+      const mime = ext === ".pdf" ? "application/pdf" : "application/octet-stream";
+      await assetStorage.saveUploadBuffer(relativePath, buf, mime);
     }
     if (!relativePath) return res.status(400).json({ error: "path or file required" });
     await db.query("UPDATE chapters SET textbook_chunk_pdf_path = ? WHERE id = ?", [relativePath, chapterId]);
+    await db.query(
+      "INSERT INTO chapter_textual_materials (chapter_id, pdf_url, title) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE pdf_url = VALUES(pdf_url), title = VALUES(title)",
+      [chapterId, relativePath, `Chapter ${chapterId} textbook`]
+    ).catch(async () => {
+      const [rows] = await db.query("SELECT id FROM chapter_textual_materials WHERE chapter_id = ? ORDER BY id DESC LIMIT 1", [chapterId]).catch(() => [[]]);
+      if (Array.isArray(rows) && rows[0]) {
+        await db.query("UPDATE chapter_textual_materials SET pdf_url = ?, title = ? WHERE id = ?", [relativePath, `Chapter ${chapterId} textbook`, rows[0].id]);
+      } else {
+        await db.query("INSERT INTO chapter_textual_materials (chapter_id, pdf_url, title) VALUES (?, ?, ?)", [chapterId, relativePath, `Chapter ${chapterId} textbook`]);
+      }
+    });
     res.json({ path: relativePath });
   } catch (err) {
     console.error("PUT /api/chapters/:id/textbook error:", err);
@@ -1763,21 +3419,48 @@ app.put("/api/topics/:id/ppt", async (req, res) => {
     if (base64File && typeof base64File === "string") {
       const ext = filename && /\.(pptx?|pdf)$/i.test(filename) ? path.extname(filename).toLowerCase() : ".pptx";
       const safeName = `topic_${topicId}${ext}`;
-      const absolutePath = path.join(pptDir, safeName);
       const buf = Buffer.from(base64File, "base64");
-      fs.writeFileSync(absolutePath, buf);
       relativePath = path.join("ppt", safeName).replace(/\\/g, "/");
+      const pptMime =
+        ext === ".pdf"
+          ? "application/pdf"
+          : ext === ".ppt"
+            ? "application/vnd.ms-powerpoint"
+            : "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+      await assetStorage.saveUploadBuffer(relativePath, buf, pptMime);
       if (ext === ".pptx" || ext === ".ppt") {
+        const tmp = path.join(os.tmpdir(), safeName);
         try {
-          const pdfPath = await convertPptToPdf(absolutePath);
-          if (pdfPath) console.log("[ppt] Converted to PDF for viewing:", path.basename(pdfPath));
+          fs.writeFileSync(tmp, buf);
+          const pdfPath = await convertPptToPdf(tmp);
+          if (pdfPath) {
+            const pdfName = path.basename(pdfPath);
+            const pdfRel = path.join("ppt", pdfName).replace(/\\/g, "/");
+            await assetStorage.saveUploadBuffer(pdfRel, fs.readFileSync(pdfPath), "application/pdf");
+            console.log("[ppt] Converted to PDF for viewing:", pdfName);
+          }
         } catch (e) {
           console.warn("[ppt] PDF conversion skipped (install LibreOffice for in-browser view):", e.message);
+        } finally {
+          try {
+            fs.unlinkSync(tmp);
+          } catch (_) {}
         }
       }
     }
     if (!relativePath) return res.status(400).json({ error: "path or file required" });
     await db.query("UPDATE topics SET topic_ppt_path = ? WHERE id = ?", [relativePath, topicId]);
+    await db.query(
+      "INSERT INTO topic_ppt_materials (topic_id, ppt_url, title) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE ppt_url = VALUES(ppt_url), title = VALUES(title)",
+      [topicId, relativePath, `Topic ${topicId} PPT`]
+    ).catch(async () => {
+      const [rows] = await db.query("SELECT id FROM topic_ppt_materials WHERE topic_id = ? ORDER BY id DESC LIMIT 1", [topicId]).catch(() => [[]]);
+      if (Array.isArray(rows) && rows[0]) {
+        await db.query("UPDATE topic_ppt_materials SET ppt_url = ?, title = ? WHERE id = ?", [relativePath, `Topic ${topicId} PPT`, rows[0].id]);
+      } else {
+        await db.query("INSERT INTO topic_ppt_materials (topic_id, ppt_url, title) VALUES (?, ?, ?)", [topicId, relativePath, `Topic ${topicId} PPT`]);
+      }
+    });
     res.json({ path: relativePath });
   } catch (err) {
     console.error("PUT /api/topics/:id/ppt error:", err);
@@ -1855,4 +3538,10 @@ const PORT = process.env.PORT || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 app.listen(Number(PORT), HOST, () => {
   console.log(`Server running on ${HOST}:${PORT}`);
+  if (assetStorage.objectStorageEnabled()) {
+    const b = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET;
+    console.log(`[uploads] Storage: S3 (bucket=${b}, region=${process.env.AWS_REGION || "us-east-1"})`);
+  } else {
+    console.log(`[uploads] Storage: local directory ${uploadsDir}`);
+  }
 });

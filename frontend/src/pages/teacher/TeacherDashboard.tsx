@@ -16,7 +16,8 @@ import PptxViewer from "@/components/PptxViewer";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { useAppData } from "@/contexts/DataContext";
 import { useAuth } from "@/contexts/AuthContext";
-import { createLeaveApplication, createLiveQuiz, getLiveQuizLeaderboard, endLiveQuiz, getApiBase, startLiveSession, submitAttendance, endLiveSession } from "@/api/client";
+import { createLeaveApplication, createLiveQuiz, getLiveQuizLeaderboard, endLiveQuiz, getApiBase, startLiveSession, submitAttendance, endLiveSession, getLiveQuizTeacherQr, fetchLiveQuizStatus, startLiveQuizCapture, submitLiveQuizAnswer, saveTopicRecommendations } from "@/api/client";
+import { liveQuizCheckpoint } from "@/lib/liveQuizCheckpoint";
 import { toast } from "sonner";
 
 type TopicLike = { id: string; chapterId: string; name: string; order: number; status: string; topicPptPath?: string | null; materials: Array<{ id: string; type: string; title: string; url: string }> };
@@ -37,7 +38,80 @@ const statusColors = {
   completed: { bg: "bg-success-light", text: "text-success", label: "Completed", color: "hsl(var(--success))" },
   in_progress: { bg: "bg-amber-light", text: "text-amber", label: "In Progress", color: "hsl(var(--amber))" },
   not_started: { bg: "bg-secondary", text: "text-muted-foreground", label: "Not Started", color: "hsl(var(--border))" },
+  /** Jan/Feb (later-term) chapters: still listed, not part of “completed syllabus” yet */
+  future_syllabus: { bg: "bg-secondary", text: "text-muted-foreground", label: "Yet to complete", color: "hsl(var(--border))" },
 };
+
+type ChapterStatusKey = keyof typeof statusColors;
+
+function normalizeTopicStatus(raw: string | undefined | null): ChapterStatusKey {
+  const s = String(raw || "not_started")
+    .toLowerCase()
+    .trim()
+    .replace(/-/g, "_");
+  if (s === "completed") return "completed";
+  if (s === "in_progress" || s === "planned") return "in_progress";
+  return "not_started";
+}
+
+/** Coerce API ids so topic↔chapter joins and status map lookups work if JSON mixes string/number ids. */
+function sameId(a: unknown, b: unknown): boolean {
+  return String(a ?? "") === String(b ?? "");
+}
+
+/** When a chapter has topics, badge + progress must follow topic rows from the API — not stale local chapter state. */
+function deriveChapterStatusKey(
+  chTopics: Array<{ id: string; status?: string }>,
+  topicStatusState: Record<string, string>
+): ChapterStatusKey {
+  if (chTopics.length === 0) return "not_started";
+  const norms = chTopics.map((t) => normalizeTopicStatus(topicStatusState[String(t.id)] ?? t.status));
+  if (norms.every((x) => x === "completed")) return "completed";
+  if (norms.some((x) => x === "in_progress")) return "in_progress";
+  if (norms.some((x) => x === "completed")) return "in_progress";
+  return "not_started";
+}
+
+/** Calendar month on chapter rows (`macro_month_label`); Jan/Feb are excluded from syllabus completion scope. */
+const SYLLABUS_MONTH_ORDER: Record<string, number> = {
+  june: 6,
+  july: 7,
+  august: 8,
+  september: 9,
+  october: 10,
+  november: 11,
+  december: 12,
+  january: 13,
+  february: 14,
+};
+
+function chapterMonthOrder(monthLabel: string | null | undefined): number | null {
+  if (monthLabel == null || String(monthLabel).trim() === "") return null;
+  const raw = String(monthLabel).trim().toLowerCase();
+  const tokens = raw.split(/[-/\s]+/).filter(Boolean);
+  const last = tokens[tokens.length - 1];
+  return SYLLABUS_MONTH_ORDER[last] ?? null;
+}
+
+/** Chapters through December count toward syllabus completion; Jan/Feb are shown but treated as not done yet. */
+function isChapterInSyllabusThroughDecember(ch: { monthLabel?: string | null }): boolean {
+  const ord = chapterMonthOrder(ch.monthLabel);
+  if (ord === null) return true;
+  return ord <= SYLLABUS_MONTH_ORDER.december;
+}
+
+/** Same syllabus rules everywhere (chapter list, lesson plan modal): Jan/Feb topics show “Yet to complete” even if DB says completed. */
+function displayTopicSyllabusLabel(
+  chapter: { monthLabel?: string | null } | undefined,
+  topicId: string,
+  topicStatus: string | undefined,
+  topicStatusState: Record<string, string>
+): string {
+  if (chapter && !isChapterInSyllabusThroughDecember(chapter)) return "Yet to complete";
+  const raw = topicStatusState[String(topicId)] ?? topicStatus ?? "not_started";
+  const k = normalizeTopicStatus(raw);
+  return statusColors[k].label;
+}
 
 const materialTypeIcons: Record<string, typeof FileText> = {
   ppt: Presentation, pdf: FileText, video: PlayCircle, image: Image,
@@ -45,8 +119,29 @@ const materialTypeIcons: Record<string, typeof FileText> = {
   simulation: Microscope, vr: Globe,
 };
 
-const AI_API_BASE = (typeof import.meta.env !== "undefined" && import.meta.env.VITE_AI_API_URL) || "http://localhost:8000";
+function getLocalDateYmd() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
 
+const AI_API_BASE = (
+  (typeof import.meta.env !== "undefined" && import.meta.env.VITE_AI_API_URL)
+    ? String(import.meta.env.VITE_AI_API_URL).trim()
+    : import.meta.env?.DEV
+      ? "http://127.0.0.1:8000"
+      : ""
+).replace(/\/$/, "");
+const AI_API_BASE_CANDIDATES = Array.from(
+  new Set(
+    [AI_API_BASE, "http://127.0.0.1:8000", "http://localhost:8000"]
+      .map((v) => String(v || "").trim().replace(/\/$/, ""))
+      .filter(Boolean)
+  )
+);
+const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** Direct file URL (for download / open in new tab). */
 function getMaterialDirectUrl(relativePath: string): string {
   const base = getApiBase();
@@ -62,22 +157,8 @@ function isPptxPath(relativePath: string | null): boolean {
   return !!relativePath && /\.pptx?$/i.test(relativePath);
 }
 
-// Static YouTube and E-resources (no API). Titles fetched from YouTube oEmbed when panel opens.
-const STATIC_YOUTUBE_VIDEOS = [
-  { url: "https://www.youtube.com/watch?v=D1Ymc311XS8" },
-  { url: "https://www.youtube.com/watch?v=gDjeEWpyoRA" },
-  { url: "https://www.youtube.com/watch?v=dAF5FngVa7A" },
-  { url: "https://www.youtube.com/watch?v=D2Y_eEaxrYo" },
-  { url: "https://www.youtube.com/watch?v=2V23PTdHuQc" },
-];
-const STATIC_E_RESOURCES = [
-  { title: "Byju's – Photosynthesis", url: "https://byjus.com/biology/photosynthesis/" },
-  { title: "Aakash – Photosynthesis (CBSE Class 10)", url: "https://www.aakash.ac.in/blog/what-is-photosynthesis-revision-notes-from-cbse-class-10-biology/" },
-  { title: "Scribd – ICSE Class 10 Selina Biology Ch.6", url: "https://www.scribd.com/document/858489050/ICSE-Class-10-Selina-Biology-Chapter-06-Photosynthesis" },
-  { title: "Britannica – Photosynthesis", url: "https://www.britannica.com/science/photosynthesis" },
-  { title: "KnowledgeBoat – ICSE Class 10 Photosynthesis", url: "https://www.knowledgeboat.com/learn/class-10-icse-concise-biology-selina/solutions/2ADRN/photosynthesis" },
-];
-
+type YouTubeReco = { title: string; url: string; description?: string };
+type ResourceReco = { title: string; url: string; snippet?: string };
 const TeacherDashboard = () => {
   const [aiOpen, setAiOpen] = useState(false);
   const [lessonPlanOpen, setLessonPlanOpen] = useState(false);
@@ -100,6 +181,8 @@ const TeacherDashboard = () => {
   const liveSessionsFromApi = data.liveSessions as LiveSessionLike[];
   const chapterQuizzes = data.chapterQuizzes || [];
   const studentUsageLogs = (data.studentUsageLogs || []) as Array<{ studentId: string; date: string; minutes: number }>;
+  const timetables = (data.timetables || []) as Array<{ classId: string; weekDay: number; periodNo: number; subjectName: string; subjectId?: string | null; teacherId?: string | null; startTime: string; endTime: string }>;
+  const coCurricularActivities = (data.coCurricularActivities || []) as Array<{ id: string; title: string; description: string; date: string; status: string; icon: string; registrations: number; classId?: string | null; teacherId?: string | null }>;
 
   const urlClass = searchParams.get("class") || "";
   const urlSubject = searchParams.get("subject") || "";
@@ -127,20 +210,30 @@ const TeacherDashboard = () => {
   const [selectedChapter, setSelectedChapter] = useState<string | null>(null);
   const [expandedTopics, setExpandedTopics] = useState<Record<string, boolean>>({});
   const filteredChaptersForTopics = useMemo(
-    () => chapters.filter((ch) => ch.subjectId === selectedSubject && ch.grade === grade),
+    () =>
+      chapters.filter(
+        (ch) => String(ch.subjectId) === String(selectedSubject) && Number(ch.grade) === Number(grade)
+      ),
     [chapters, selectedSubject, grade]
   );
   const topicIdsForFilteredChapters = useMemo(
-    () => new Set(topics.filter((t) => filteredChaptersForTopics.some((c) => c.id === t.chapterId)).map((t) => t.id)),
+    () =>
+      new Set(
+        topics
+          .filter((t) => filteredChaptersForTopics.some((c) => sameId(c.id, t.chapterId)))
+          .map((t) => String(t.id))
+      ),
     [topics, filteredChaptersForTopics]
   );
   const [topicStatusState, setTopicStatusState] = useState<Record<string, string>>({});
   useEffect(() => {
     const initial: Record<string, string> = {};
     topics.forEach((t) => {
-      if (topicIdsForFilteredChapters.has(t.id)) initial[t.id] = t.status || "not_started";
+      const tid = String(t.id);
+      if (topicIdsForFilteredChapters.has(tid)) initial[tid] = t.status || "not_started";
     });
-    setTopicStatusState((prev) => ({ ...initial, ...prev }));
+    // Prefer values from API (`initial`) over stale local state when data is refetched.
+    setTopicStatusState((prev) => ({ ...prev, ...initial }));
   }, [topics, topicIdsForFilteredChapters]);
 
   const filteredChapters = filteredChaptersForTopics;
@@ -151,8 +244,18 @@ const TeacherDashboard = () => {
   const [attendanceMarked, setAttendanceMarked] = useState(false);
   const [sessionQuizDone, setSessionQuizDone] = useState(false);
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
-  const [showEResourcesPanel, setShowEResourcesPanel] = useState(false);
-  const [youtubeTitles, setYoutubeTitles] = useState<Record<string, string>>({});
+  // Fallback links so the panel still works when AI API is offline.
+  const FALLBACK_YOUTUBE_VIDEOS: YouTubeReco[] = [
+    { title: "Social Studies — Relief Features (Intro)", url: "https://www.youtube.com/watch?v=D1Ymc311XS8" },
+    { title: "Northern Plains & Rivers (Basics)", url: "https://www.youtube.com/watch?v=gDjeEWpyoRA" },
+    { title: "Plateaus of India (Overview)", url: "https://www.youtube.com/watch?v=dAF5FngVa7A" },
+    { title: "Western Ghats & Coasts", url: "https://www.youtube.com/watch?v=D2Y_eEaxrYo" },
+    { title: "India — Map & Regions (Practice)", url: "https://www.youtube.com/watch?v=2V23PTdHuQc" },
+  ];
+
+  const [youtubeRecs, setYoutubeRecs] = useState<YouTubeReco[]>([]);
+  const [youtubeRecLoading, setYoutubeRecLoading] = useState(false);
+  const [youtubeRecError, setYoutubeRecError] = useState<string | null>(null);
   const [materialPreviewOpen, setMaterialPreviewOpen] = useState(false);
   const [materialPreviewUrl, setMaterialPreviewUrl] = useState<string | null>(null);
   const [materialPreviewRelativePath, setMaterialPreviewRelativePath] = useState<string | null>(null);
@@ -162,9 +265,16 @@ const TeacherDashboard = () => {
   const [mainScreenDirectUrl, setMainScreenDirectUrl] = useState<string | null>(null);
   const [liveQuizSession, setLiveQuizSession] = useState<{ id: string; questions: Array<{ id: string; questionText: string; optionA: string; optionB: string; optionC: string; optionD: string; correctOption: string; explanation: string }> } | null>(null);
   const [liveQuizLeaderboard, setLiveQuizLeaderboard] = useState<Array<{ rank: number; studentId: string; studentName: string; score: number }>>([]);
+  const [liveQuizTeacherQr, setLiveQuizTeacherQr] = useState<string | null>(null);
+  const [liveQuizStatus, setLiveQuizStatus] = useState<{ started: boolean; connectedDevices: number; questions: number; students: number; answersCaptured: number; attendanceReady?: boolean; attendanceDate?: string; currentQuestionNo?: number; progressByQuestion?: Record<string, number>; submitted?: boolean } | null>(null);
+  const [liveQuizCaptureMode, setLiveQuizCaptureMode] = useState<"manual" | "qr">("manual");
+  const [manualQuestionNo, setManualQuestionNo] = useState(1);
+  const [manualSelections, setManualSelections] = useState<Record<string, Record<string, string>>>({});
+  const [manualSubmittingStudentId, setManualSubmittingStudentId] = useState<string | null>(null);
   const [liveQuizLaunching, setLiveQuizLaunching] = useState(false);
   const [showLaunchQuizDialog, setShowLaunchQuizDialog] = useState(false);
   const liveQuizLeaderboardRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const liveQuizStatusPollSeq = useRef(0);
   const [sessionStartLoading, setSessionStartLoading] = useState(false);
   const [attendanceSubmitting, setAttendanceSubmitting] = useState(false);
   const [sessionEnding, setSessionEnding] = useState(false);
@@ -174,15 +284,20 @@ const TeacherDashboard = () => {
 
   const classStatusState = useMemo(
     () =>
-      classStatusFromApi.filter((cs) => cs.classId === selectedClass) as Array<{
+      classStatusFromApi.filter((cs) => {
+        if (cs.classId !== selectedClass) return false;
+        if (!selectedSubject) return true;
+        return !cs.subjectId || cs.subjectId === selectedSubject;
+      }) as Array<{
         id: string;
         date: string;
         classId: string;
+        subjectId?: string | null;
         status: "conducted" | "cancelled";
         teacherId: string;
         reason?: string;
       }>,
-    [classStatusFromApi, selectedClass]
+    [classStatusFromApi, selectedClass, selectedSubject]
   );
   const [classStatusLocal, setClassStatusLocal] = useState<typeof classStatusState>([]);
   useEffect(() => {
@@ -227,6 +342,23 @@ const TeacherDashboard = () => {
     setRegisteringActivity(null);
     setRegisterStudentId("");
   };
+
+  useEffect(() => {
+    const filtered = coCurricularActivities
+      .filter((a) => !a.classId || a.classId === selectedClass)
+      .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")))
+      .slice(0, 20)
+      .map((a) => ({
+        id: a.id,
+        title: a.title,
+        description: a.description,
+        date: a.date,
+        status: a.status,
+        icon: a.icon || "🏅",
+        registrations: a.registrations || 0,
+      }));
+    setActivities(filtered);
+  }, [coCurricularActivities, selectedClass]);
 
   const classStudents = useMemo(() => students.filter((s) => s.classId === selectedClass), [students, selectedClass]);
 
@@ -305,10 +437,12 @@ const TeacherDashboard = () => {
   const detailedWeak = detailedSubjectPerf.filter((s) => s.score > 0 && s.score < 60).sort((a, b) => a.score - b.score);
 
   const filteredChapterIds = filteredChapters.map((ch) => ch.id);
+  /** Full chapter count (e.g. 21). Completed = only June–Dec chapters that are fully done; Jan/Feb never count as completed yet. */
   const completedChapterCount = filteredChapters.filter((ch) => {
-    const chTopics = topics.filter((t) => t.chapterId === ch.id);
-    if (chTopics.length === 0) return (chapterStatusState[ch.id] || "not_started") === "completed";
-    return chTopics.every((t) => (topicStatusState[t.id] ?? t.status) === "completed");
+    if (!isChapterInSyllabusThroughDecember(ch)) return false;
+    const chTopics = topics.filter((t) => sameId(t.chapterId, ch.id));
+    if (chTopics.length === 0) return (chapterStatusState[String(ch.id)] || "not_started") === "completed";
+    return chTopics.every((t) => (topicStatusState[String(t.id)] ?? t.status) === "completed");
   }).length;
   const syllabusProgress = filteredChapters.length > 0
     ? Math.round((completedChapterCount / filteredChapters.length) * 100)
@@ -323,7 +457,7 @@ const TeacherDashboard = () => {
         .map((r) => r.chapterId)
     )
   );
-  const totalQuizCount = totalQuizChapterIds.length;
+  const totalQuizCount = totalQuizChapterIds.length > 0 ? totalQuizChapterIds.length : filteredChapterIds.length;
   const completedQuizCount = completedQuizChapterIds.length;
   const conductedSessions = classStatusLocal.filter((cs) => cs.status === "conducted").length;
   const scheduledSessions = classStatusLocal.length;
@@ -355,59 +489,396 @@ const TeacherDashboard = () => {
   useEffect(() => {
     if (activeSession?.topicName) {
       setShowYoutubePanel(false);
-      setShowEResourcesPanel(false);
     }
   }, [activeSession?.topicName]);
 
-  // Fetch real YouTube video titles via oEmbed when the YouTube panel is shown
+  // Fetch context-aware YouTube recommendations for the current live session.
   useEffect(() => {
-    if (!showYoutubePanel) return;
+    if (!showYoutubePanel || !activeSession || !currentClass || !currentSubject) return;
     let cancelled = false;
-    STATIC_YOUTUBE_VIDEOS.forEach((v) => {
-      const fallbackTitle = (() => {
-        const m = v.url.match(/[?&]v=([^&]+)/);
-        return m ? `YouTube video ${m[1].slice(0, 8)}` : "YouTube video";
-      })();
-      fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(v.url)}&format=json`)
-        .then((res) => res.ok ? res.json() : null)
-        .then((data: { title?: string } | null) => {
-          if (cancelled) return;
-          setYoutubeTitles((prev) => ({ ...prev, [v.url]: data?.title || fallbackTitle }));
-        })
-        .catch(() => {
-          if (!cancelled) setYoutubeTitles((prev) => ({ ...prev, [v.url]: fallbackTitle }));
-        });
-    });
+      const fetchRecommendations = async () => {
+      setYoutubeRecLoading(true);
+      setYoutubeRecError(null);
+      if (!AI_API_BASE) {
+        if (!cancelled) setYoutubeRecs(FALLBACK_YOUTUBE_VIDEOS);
+        if (!cancelled) setYoutubeRecLoading(false);
+        return;
+      }
+      try {
+        const query = `${activeSession.topicName} ${currentSubject.name} class ${currentClass.grade} ${currentClass.name}`.trim();
+        let res: Response | null = null;
+        let lastErr: unknown = null;
+        for (let attempt = 0; attempt < 2 && !res; attempt++) {
+          for (const base of AI_API_BASE_CANDIDATES) {
+            try {
+              res = await fetch(`${base}/recommend`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  topic: activeSession.topicName,
+                  chapter: selectedChapterObj?.name || "",
+                  subject: currentSubject.name,
+                  grade: currentClass.grade,
+                  query,
+                }),
+              });
+              if (res.ok) break;
+              if (res.status >= 500) {
+                // AI can need a moment during model warm-up or auto-reload in dev.
+                res = null;
+              }
+            } catch (err) {
+              lastErr = err;
+            }
+          }
+          if (!res && attempt === 0) await waitMs(900);
+        }
+        if (!res) {
+          throw (lastErr instanceof Error ? lastErr : new Error("Recommendation service unavailable"));
+        }
+        if (!res.ok) throw new Error("Recommendation service unavailable");
+        const data = await res.json() as { videos?: YouTubeReco[]; resources?: ResourceReco[] };
+        const videos = (data.videos || []).filter((v) => /^https:\/\/www\.youtube\.com\/watch\?v=/.test(String(v.url || ""))).slice(0, 5);
+        if (!cancelled) {
+          setYoutubeRecs(videos);
+          if (videos.length < 1) setYoutubeRecError("No videos found for this lesson context; showing fallback links.");
+          if (videos.length < 1) setYoutubeRecs(FALLBACK_YOUTUBE_VIDEOS);
+        }
+        // Persist recommendation context for student corner visibility where available.
+        if (!cancelled && videos.length > 0 && activeSession.topicId && activeSession.chapterId && activeSession.subjectId) {
+          try {
+            await saveTopicRecommendations({
+              topicId: activeSession.topicId,
+              chapterId: activeSession.chapterId,
+              subjectId: activeSession.subjectId,
+              grade: currentClass.grade,
+              topicName: activeSession.topicName,
+              classId: activeSession.classId,
+              schoolId: currentClass.schoolId,
+              videos: videos.map((v) => ({ title: v.title || "Video", url: v.url, description: v.description || "" })),
+              resources: (data.resources || []).map((r) => ({ title: r.title || "Resource", url: r.url, snippet: r.snippet || "" })),
+            });
+          } catch {
+            // Non-blocking for teacher UX.
+          }
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setYoutubeRecs(FALLBACK_YOUTUBE_VIDEOS);
+          const isConnectivityIssue =
+            e instanceof TypeError ||
+            (e instanceof Error && /failed to fetch|network|unavailable/i.test(e.message));
+          setYoutubeRecError(
+            isConnectivityIssue
+              ? "AI service is starting or temporarily unreachable. Showing fallback videos."
+              : e instanceof Error
+                ? `AI recommendations unavailable (${e.message}). Showing fallback videos.`
+                : "AI recommendations unavailable. Showing fallback videos."
+          );
+        }
+      } finally {
+        if (!cancelled) setYoutubeRecLoading(false);
+      }
+    };
+    fetchRecommendations().catch(() => {});
     return () => { cancelled = true; };
-  }, [showYoutubePanel]);
+  }, [showYoutubePanel, activeSession, currentClass, currentSubject, selectedChapterObj?.name]);
 
   const openYoutubeRecos = useCallback(() => setShowYoutubePanel(true), []);
-  const openEResourcesRecos = useCallback(() => setShowEResourcesPanel(true), []);
 
-  const handleLaunchLiveQuiz = useCallback(() => {
+  /** Clear live-quiz UI and local scan buffers so a new live session never inherits the previous one. */
+  const resetLiveQuizUiState = useCallback(() => {
+    liveQuizCheckpoint("reset_live_quiz_ui");
+    if (liveQuizLeaderboardRef.current) {
+      clearInterval(liveQuizLeaderboardRef.current);
+      liveQuizLeaderboardRef.current = null;
+    }
+    setLiveQuizSession(null);
+    setLiveQuizLeaderboard([]);
+    setLiveQuizTeacherQr(null);
+    setLiveQuizStatus(null);
+    setLiveQuizCaptureMode("manual");
+    setManualQuestionNo(1);
+    setManualSelections({});
+    setManualSubmittingStudentId(null);
+    setShowLaunchQuizDialog(false);
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("liveQuizBuffer_")) localStorage.removeItem(k);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const handleLaunchLiveQuiz = useCallback(async () => {
     if (!activeSession) {
+      liveQuizCheckpoint("launch_quiz:blocked", { reason: "no_active_session" });
       toast.error("Start a live teaching session before launching a quiz.");
       return;
     }
-    setSessionQuizDone(true);
-    setShowLaunchQuizDialog(true);
-  }, [activeSession]);
+    if (!attendanceMarked) {
+      liveQuizCheckpoint("launch_quiz:blocked", { reason: "attendance_not_marked", liveSessionId: activeSession.id });
+      toast.error("Submit attendance first. Only present students can take the quiz.");
+      return;
+    }
+    if (liveQuizLaunching) return;
+    setLiveQuizLaunching(true);
+    liveQuizCheckpoint("launch_quiz:start", { liveSessionId: activeSession.id, classId: activeSession.classId });
+    try {
+      // Clear any existing polling loop
+      if (liveQuizLeaderboardRef.current) {
+        clearInterval(liveQuizLeaderboardRef.current);
+        liveQuizLeaderboardRef.current = null;
+      }
+
+      // Create/get quiz session (one quiz per live session)
+      const created = await createLiveQuiz({
+        teacherId: activeSession.teacherId,
+        classId: activeSession.classId,
+        chapterId: activeSession.chapterId,
+        topicId: activeSession.topicId,
+        topicName: activeSession.topicName,
+        subjectId: activeSession.subjectId,
+        liveSessionId: activeSession.id,
+      });
+      liveQuizCheckpoint("launch_quiz:quiz_created", {
+        liveQuizSessionId: created.id,
+        questionCount: created.questions?.length ?? 0,
+      });
+      setLiveQuizSession({ id: created.id, questions: created.questions });
+      setLiveQuizCaptureMode("manual");
+      setManualQuestionNo(1);
+      setManualSelections({});
+      setManualSubmittingStudentId(null);
+      try {
+        const qr = await getLiveQuizTeacherQr(created.id);
+        setLiveQuizTeacherQr(qr.dataUrl || null);
+      } catch {
+        setLiveQuizTeacherQr(null);
+      }
+      try {
+        const st = await fetchLiveQuizStatus(created.id);
+        liveQuizCheckpoint("launch_quiz:initial_status", {
+          liveQuizSessionId: created.id,
+          students: st.students,
+          attendanceDate: st.attendanceDate,
+          attendanceReady: st.attendanceReady,
+          answersCaptured: st.answersCaptured,
+          questions: st.questions,
+        });
+        setLiveQuizStatus({
+          started: st.started,
+          connectedDevices: st.connectedDevices,
+          questions: st.questions,
+          students: st.students,
+          answersCaptured: st.answersCaptured,
+          attendanceReady: st.attendanceReady,
+          attendanceDate: st.attendanceDate,
+          currentQuestionNo: st.currentQuestionNo,
+          progressByQuestion: st.progressByQuestion,
+          submitted: st.submitted,
+        });
+      } catch {
+        liveQuizCheckpoint("launch_quiz:initial_status_failed", { liveQuizSessionId: created.id });
+        setLiveQuizStatus(null);
+      }
+
+      // Fetch leaderboard now and keep it fresh
+      try {
+        const lb = await getLiveQuizLeaderboard(created.id);
+        setLiveQuizLeaderboard(lb.leaderboard || []);
+      } catch {
+        setLiveQuizLeaderboard([]);
+      }
+      liveQuizLeaderboardRef.current = setInterval(async () => {
+        try {
+          const lb = await getLiveQuizLeaderboard(created.id);
+          setLiveQuizLeaderboard(lb.leaderboard || []);
+        } catch {
+          // ignore transient errors
+        }
+      }, 5000);
+
+      setSessionQuizDone(true);
+      setShowLaunchQuizDialog(true);
+      liveQuizCheckpoint("launch_quiz:dialog_open");
+    } catch (e) {
+      liveQuizCheckpoint("launch_quiz:error", { message: e instanceof Error ? e.message : String(e) });
+      console.error(e);
+      toast.error(e instanceof Error ? e.message : "Failed to launch quiz");
+    } finally {
+      setLiveQuizLaunching(false);
+    }
+  }, [activeSession, attendanceMarked, liveQuizLaunching]);
 
   const handleEndLiveQuiz = useCallback(async () => {
     if (!liveQuizSession) return;
+    liveQuizCheckpoint("end_quiz:click", { liveQuizSessionId: liveQuizSession.id, mode: liveQuizCaptureMode });
+    if (liveQuizCaptureMode === "qr") {
+      try {
+        const status = await fetchLiveQuizStatus(liveQuizSession.id);
+        if (!status.submitted) {
+          liveQuizCheckpoint("end_quiz:blocked", { reason: "not_submitted_from_mobile" });
+          toast.error("Mobile scanner has not submitted final answers yet.");
+          return;
+        }
+      } catch {
+        liveQuizCheckpoint("end_quiz:status_fetch_failed");
+        toast.error("Unable to verify final submission status.");
+        return;
+      }
+    }
     if (liveQuizLeaderboardRef.current) {
       clearInterval(liveQuizLeaderboardRef.current);
       liveQuizLeaderboardRef.current = null;
     }
     try {
       await endLiveQuiz(liveQuizSession.id);
+      liveQuizCheckpoint("end_quiz:api_ok");
       setLiveQuizSession(null);
       setLiveQuizLeaderboard([]);
+      setLiveQuizTeacherQr(null);
+      setLiveQuizStatus(null);
       if (refetch) refetch();
     } catch (e) {
+      liveQuizCheckpoint("end_quiz:api_error", { message: e instanceof Error ? e.message : String(e) });
       console.error(e);
     }
-  }, [liveQuizSession, refetch]);
+  }, [liveQuizSession, refetch, liveQuizCaptureMode]);
+
+  const handleStartLiveQuizCapture = useCallback(async () => {
+    if (!liveQuizSession) return;
+    liveQuizCheckpoint("start_capture:click", { liveQuizSessionId: liveQuizSession.id });
+    try {
+      await startLiveQuizCapture(liveQuizSession.id);
+      toast.success("Capture started. Mobile scanner can now submit all answers.");
+      const st = await fetchLiveQuizStatus(liveQuizSession.id);
+      liveQuizCheckpoint("start_capture:status_after", {
+        students: st.students,
+        attendanceReady: st.attendanceReady,
+        attendanceDate: st.attendanceDate,
+        started: st.started,
+      });
+      setLiveQuizStatus({
+        started: st.started,
+        connectedDevices: st.connectedDevices,
+        questions: st.questions,
+        students: st.students,
+        answersCaptured: st.answersCaptured,
+        attendanceReady: st.attendanceReady,
+        attendanceDate: st.attendanceDate,
+        currentQuestionNo: st.currentQuestionNo,
+        progressByQuestion: st.progressByQuestion,
+        submitted: st.submitted,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unable to start capture";
+      liveQuizCheckpoint("start_capture:error", { message: msg });
+      toast.error(msg);
+    }
+  }, [liveQuizSession]);
+
+  const manualEligibleStudents = useMemo(
+    () => classStudents.filter((s) => sessionAttendance[s.id]),
+    [classStudents, sessionAttendance]
+  );
+  const manualCurrentQuestion = useMemo(() => {
+    const list = liveQuizSession?.questions || [];
+    if (list.length < 1) return null;
+    const idx = Math.min(Math.max(1, manualQuestionNo), list.length) - 1;
+    return list[idx] || null;
+  }, [liveQuizSession?.questions, manualQuestionNo]);
+  const manualCurrentAnswers = useMemo(
+    () => manualSelections[String(manualQuestionNo)] || {},
+    [manualSelections, manualQuestionNo]
+  );
+
+  const handleManualSelectOption = useCallback(
+    async (studentId: string, selectedOption: string) => {
+      if (!liveQuizSession || !manualCurrentQuestion) return;
+      try {
+        setManualSubmittingStudentId(studentId);
+        await submitLiveQuizAnswer(liveQuizSession.id, studentId, manualCurrentQuestion.id, selectedOption);
+        setManualSelections((prev) => ({
+          ...prev,
+          [String(manualQuestionNo)]: {
+            ...(prev[String(manualQuestionNo)] || {}),
+            [studentId]: selectedOption,
+          },
+        }));
+        const st = await fetchLiveQuizStatus(liveQuizSession.id);
+        setLiveQuizStatus({
+          started: st.started,
+          connectedDevices: st.connectedDevices,
+          questions: st.questions,
+          students: st.students,
+          answersCaptured: st.answersCaptured,
+          attendanceReady: st.attendanceReady,
+          attendanceDate: st.attendanceDate,
+          currentQuestionNo: st.currentQuestionNo,
+          progressByQuestion: st.progressByQuestion,
+          submitted: st.submitted,
+        });
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "Failed to save answer");
+      } finally {
+        setManualSubmittingStudentId(null);
+      }
+    },
+    [liveQuizSession, manualCurrentQuestion, manualQuestionNo]
+  );
+
+  useEffect(() => {
+    if (!showLaunchQuizDialog || !liveQuizSession) return;
+    liveQuizStatusPollSeq.current = 0;
+    let t: ReturnType<typeof setInterval> | null = null;
+    const refresh = async () => {
+      try {
+        const st = await fetchLiveQuizStatus(liveQuizSession.id);
+        liveQuizStatusPollSeq.current += 1;
+        const seq = liveQuizStatusPollSeq.current;
+        if (seq === 1 || seq % 5 === 0) {
+          liveQuizCheckpoint("dialog_poll:status", {
+            pollSeq: seq,
+            liveQuizSessionId: liveQuizSession.id,
+            students: st.students,
+            attendanceDate: st.attendanceDate,
+            attendanceReady: st.attendanceReady,
+            answersCaptured: st.answersCaptured,
+            submitted: st.submitted,
+          });
+        }
+        setLiveQuizStatus({
+          started: st.started,
+          connectedDevices: st.connectedDevices,
+          questions: st.questions,
+          students: st.students,
+          answersCaptured: st.answersCaptured,
+          attendanceReady: st.attendanceReady,
+          attendanceDate: st.attendanceDate,
+          currentQuestionNo: st.currentQuestionNo,
+          progressByQuestion: st.progressByQuestion,
+          submitted: st.submitted,
+        });
+      } catch {
+        // ignore transient errors
+      }
+      try {
+        const lb = await getLiveQuizLeaderboard(liveQuizSession.id);
+        setLiveQuizLeaderboard(lb.leaderboard || []);
+      } catch {
+        // ignore transient errors
+      }
+    };
+    refresh();
+    t = setInterval(refresh, 3000);
+    return () => {
+      if (t) clearInterval(t);
+      liveQuizStatusPollSeq.current = 0;
+    };
+  }, [liveQuizSession, showLaunchQuizDialog]);
 
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);
@@ -415,11 +886,21 @@ const TeacherDashboard = () => {
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
 
-  // Chapter progress based on topics
+  const liveQuizCurrentQuestion = useMemo(() => {
+    const list = liveQuizSession?.questions;
+    if (!list?.length) return null;
+    const rawNo = Number(liveQuizCaptureMode === "manual" ? manualQuestionNo : (liveQuizStatus?.currentQuestionNo ?? 1));
+    const qNo = Math.min(Math.max(1, rawNo || 1), list.length);
+    return { index: qNo, question: list[qNo - 1] };
+  }, [liveQuizSession?.questions, liveQuizStatus?.currentQuestionNo, liveQuizCaptureMode, manualQuestionNo]);
+
+  // Chapter progress based on topics (later-term Jan/Feb chapters stay at 0% until their term is active)
   const getChapterProgress = (chapterId: string) => {
-    const chTopics = topics.filter(t => t.chapterId === chapterId);
+    const ch = chapters.find((c) => sameId(c.id, chapterId));
+    if (ch && !isChapterInSyllabusThroughDecember(ch)) return 0;
+    const chTopics = topics.filter((t) => sameId(t.chapterId, chapterId));
     if (chTopics.length === 0) return 0;
-    const completed = chTopics.filter(t => (topicStatusState[t.id] || t.status) === "completed").length;
+    const completed = chTopics.filter((t) => (topicStatusState[String(t.id)] || t.status) === "completed").length;
     return Math.round((completed / chTopics.length) * 100);
   };
 
@@ -430,6 +911,8 @@ const TeacherDashboard = () => {
   const handleStartSession = async (topic: TopicLike) => {
     if (!teacherId || !selectedClass || !selectedSubject || !currentClass || !currentSubject) return;
     setSessionStartLoading(true);
+    resetLiveQuizUiState();
+    liveQuizCheckpoint("live_session:start_request", { classId: selectedClass, subjectId: selectedSubject, topicId: topic.id });
     try {
       const created = await startLiveSession({
         teacherId,
@@ -460,8 +943,10 @@ const TeacherDashboard = () => {
       setSessionAttendance(Object.fromEntries(classStudents.map((s) => [s.id, false])));
       setAttendanceMarked(false);
       setSessionQuizDone(false);
+      liveQuizCheckpoint("live_session:created", { liveSessionId: session.id, classId: session.classId });
       refetch?.();
     } catch (e) {
+      liveQuizCheckpoint("live_session:error", { message: e instanceof Error ? e.message : String(e) });
       console.error(e);
       toast.error(e instanceof Error ? e.message : "Failed to start session");
     } finally {
@@ -472,12 +957,14 @@ const TeacherDashboard = () => {
   const handleEndSession = async () => {
     if (!activeSession) return;
     setSessionEnding(true);
+    liveQuizCheckpoint("live_session:end_request", { liveSessionId: activeSession.id });
     try {
       const sessionId = activeSession.id;
       if (/^\d+$/.test(sessionId)) {
         await endLiveSession(sessionId);
+        liveQuizCheckpoint("live_session:end_ok", { liveSessionId: sessionId });
       }
-      setTopicStatusState((prev) => ({ ...prev, [activeSession.topicId]: "completed" }));
+      setTopicStatusState((prev) => ({ ...prev, [String(activeSession.topicId)]: "completed" }));
       const today = new Date().toISOString().split("T")[0];
       setClassStatusLocal((prev) => [
         { id: `cs_${Date.now()}`, date: today, classId: selectedClass, status: "conducted" as const, teacherId: teacherId || "" },
@@ -485,6 +972,7 @@ const TeacherDashboard = () => {
       ]);
       setActiveSession(null);
       setSessionTime(0);
+      resetLiveQuizUiState();
       refetch?.();
     } catch (e) {
       console.error(e);
@@ -496,18 +984,30 @@ const TeacherDashboard = () => {
 
   const handleMarkAttendance = async () => {
     if (!activeSession || !classStudents.length) return;
-    const date = new Date().toISOString().split("T")[0];
+    const date = getLocalDateYmd();
     const entries = classStudents.map((s) => ({
       studentId: s.id,
       status: (sessionAttendance[s.id] ? "present" : "absent") as "present" | "absent",
     }));
+    const presentCount = entries.filter((e) => e.status === "present").length;
+    const absentCount = entries.length - presentCount;
     setAttendanceSubmitting(true);
+    liveQuizCheckpoint("attendance:submit", {
+      liveSessionId: activeSession.id,
+      classId: activeSession.classId,
+      date,
+      presentCount,
+      absentCount,
+      total: entries.length,
+    });
     try {
-      await submitAttendance({ classId: activeSession.classId, date, entries });
+      await submitAttendance({ classId: activeSession.classId, date, entries, liveSessionId: activeSession.id });
+      liveQuizCheckpoint("attendance:ok", { date, liveSessionId: activeSession.id });
       setAttendanceMarked(true);
       refetch?.();
       toast.success("Attendance saved.");
     } catch (e) {
+      liveQuizCheckpoint("attendance:error", { message: e instanceof Error ? e.message : String(e) });
       console.error(e);
       toast.error(e instanceof Error ? e.message : "Failed to save attendance");
     } finally {
@@ -545,7 +1045,7 @@ const TeacherDashboard = () => {
 
   if (activeSession) {
     const sessionTopic = topics.find((t) => t.id === activeSession.topicId);
-    const sessionChapter = chapters.find((c) => c.id === activeSession.chapterId);
+    const sessionChapter = chapters.find((c) => sameId(c.id, activeSession.chapterId));
     const canEnd = attendanceMarked && sessionQuizDone;
 
     return (
@@ -682,71 +1182,10 @@ const TeacherDashboard = () => {
                       <Presentation className="w-3.5 h-3.5" /> PPT
                     </Button>
                   )}
-                  <Button variant="outline" size="sm" className="gap-1.5" onClick={openEResourcesRecos}>
-                    <FileText className="w-3.5 h-3.5" /> E-resources
-                  </Button>
                 </div>
-                {showEResourcesPanel && (
-                  <div className="pt-2">
-                    <p className="text-xs font-medium text-foreground mb-3 flex items-center gap-1.5">
-                      <FileText className="w-3.5 h-3.5" /> E-resources
-                    </p>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      {STATIC_E_RESOURCES.map((r, i) => (
-                        <a
-                          key={i}
-                          href={r.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex items-center gap-3 p-3 rounded-xl border border-border bg-card hover:bg-secondary/50 transition-colors text-left"
-                        >
-                          <div className="w-10 h-10 rounded-lg bg-teal-light flex items-center justify-center flex-shrink-0">
-                            <FileText className="w-5 h-5 text-primary" />
-                          </div>
-                          <p className="text-sm font-medium text-foreground line-clamp-2">{r.title}</p>
-                        </a>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </CardContent>
             </Card>
           </div>
-
-          {/* Live quiz (in-app session card; kept for any legacy use) */}
-          {liveQuizSession && (
-            <Card className="shadow-card border-border col-span-full">
-              <CardHeader className="pb-2 flex flex-row items-center justify-between">
-                <CardTitle className="font-display text-sm">Live Quiz – {activeSession?.topicName}</CardTitle>
-                <div className="flex gap-2">
-                  <span className="text-xs text-muted-foreground">Students join: {window.location.origin}/student/live-quiz/{liveQuizSession.id}</span>
-                  <Button size="sm" variant="outline" onClick={handleEndLiveQuiz}>End quiz</Button>
-                </div>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div>
-                  <p className="text-xs font-medium text-foreground mb-2">Top 5</p>
-                  <div className="flex flex-wrap gap-2">
-                    {liveQuizLeaderboard.map((e) => (
-                      <Badge key={e.studentId} variant="secondary">#{e.rank} {e.studentName}: {e.score}</Badge>
-                    ))}
-                    {liveQuizLeaderboard.length === 0 && <p className="text-xs text-muted-foreground">No submissions yet.</p>}
-                  </div>
-                </div>
-                <div>
-                  <p className="text-xs font-medium text-foreground mb-2">Questions ({liveQuizSession.questions.length})</p>
-                  <ul className="space-y-2 max-h-48 overflow-y-auto">
-                    {liveQuizSession.questions.map((q, i) => (
-                      <li key={q.id} className="text-xs p-2 bg-secondary rounded">
-                        <span className="font-medium">{i + 1}. {q.questionText.slice(0, 80)}…</span>
-                        <span className="text-muted-foreground ml-1">A/B/C/D → {q.correctOption}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </CardContent>
-            </Card>
-          )}
 
           {/* Right sidebar - Tools & Attendance */}
           <div className="space-y-4">
@@ -770,6 +1209,17 @@ const TeacherDashboard = () => {
                     className="w-full flex items-center gap-3 p-2.5 rounded-lg hover:bg-secondary transition-colors text-left disabled:opacity-50 disabled:pointer-events-none"
                     disabled={false}
                     onClick={() => {
+                      if (tool.label === "AI PPT Generator") {
+                        if (sessionTopic?.topicPptPath) {
+                          const path = sessionTopic.topicPptPath;
+                          setMaterialPreviewRelativePath(path);
+                          setMaterialPreviewUrl(getMaterialViewerUrl(path));
+                          setMaterialPreviewTitle("PPT — " + (sessionTopic?.name ?? "Presentation"));
+                          setMaterialPreviewOpen(true);
+                        } else {
+                          toast.error("No PPT found in database for this topic.");
+                        }
+                      }
                       if (tool.label === "AI Chatbot") setAiOpen(true);
                       if (tool.label === "YouTube Recommendations") openYoutubeRecos();
                       if (tool.label === "Launch Quiz") handleLaunchLiveQuiz();
@@ -787,11 +1237,16 @@ const TeacherDashboard = () => {
                 ))}
                 {showYoutubePanel && (
                   <div className="pt-3 border-t border-border mt-3">
-                    <p className="text-xs font-medium text-foreground mb-3">YouTube Recommendations</p>
+                    <p className="text-xs font-medium text-foreground mb-1">YouTube Recommendations</p>
+                    <p className="text-[11px] text-muted-foreground mb-3">
+                      Context: {activeSession?.topicName} • {currentSubject?.name} • Class {currentClass?.grade}
+                    </p>
                     <div className="grid grid-cols-1 gap-3">
-                      {STATIC_YOUTUBE_VIDEOS.map((v, i) => (
+                      {youtubeRecLoading && <p className="text-xs text-muted-foreground">Loading recommendations…</p>}
+                      {!youtubeRecLoading && youtubeRecError && <p className="text-xs text-amber-700">{youtubeRecError}</p>}
+                      {!youtubeRecLoading && youtubeRecs.map((v, i) => (
                         <a
-                          key={i}
+                          key={`${v.url}_${i}`}
                           href={v.url}
                           target="_blank"
                           rel="noopener noreferrer"
@@ -801,10 +1256,13 @@ const TeacherDashboard = () => {
                             <PlayCircle className="w-5 h-5 text-red-600" />
                           </div>
                           <span className="text-sm font-medium text-foreground truncate">
-                            {youtubeTitles[v.url] || "Loading…"}
+                            {v.title || "YouTube video"}
                           </span>
                         </a>
                       ))}
+                      {!youtubeRecLoading && !youtubeRecError && youtubeRecs.length === 0 && (
+                        <p className="text-xs text-muted-foreground">No video recommendations available for this context.</p>
+                      )}
                     </div>
                   </div>
                 )}
@@ -859,26 +1317,196 @@ const TeacherDashboard = () => {
           </div>
         </div>
 
-        {/* Launch Quiz — external quiz app in dialog; chapter & topic pre-filled via URL params */}
+        {/* Launch Quiz — fully internal scanner flow (no external redirect/iframe) */}
         <Dialog open={showLaunchQuizDialog} onOpenChange={setShowLaunchQuizDialog}>
-          <DialogContent className="max-w-4xl max-h-[90vh] flex flex-col gap-4" aria-describedby={undefined}>
+          <DialogContent
+            className="w-[min(98vw,1240px)] max-w-[98vw] h-[min(92dvh,860px)] max-h-[92dvh] p-4 sm:p-6 flex flex-col gap-3 sm:gap-4 overflow-y-auto"
+            aria-describedby={undefined}
+          >
             <DialogHeader className="flex-shrink-0">
-              <DialogTitle className="font-display">Live Quiz – Teacher Quiz</DialogTitle>
+              <DialogTitle className="font-display">Live Quiz — Internal QR Scanner</DialogTitle>
               <DialogDescription id="quiz-dialog-desc">
-                Chapter and topic from your current session are passed to the quiz page. If they are not pre-filled, enter them and click Generate quiz. When you are done, close this dialog.
+                Step 1: scan this QR from mobile. Step 2: wait for device connection signal. Step 3: start capture and scan all 10 questions for all students from mobile.
               </DialogDescription>
             </DialogHeader>
-            <div className="flex-1 min-h-0 flex flex-col gap-3">
-              <iframe
-                title="Teacher Quiz – Live QR Scan"
-                src={`https://quiz-1-qo31.onrender.com?chapter=${encodeURIComponent(sessionChapter?.name || activeSession?.topicName || "")}&topic=${encodeURIComponent(activeSession?.topicName || "")}`}
-                className="w-full flex-1 min-h-[480px] rounded-lg border border-border bg-muted/30"
-                allow="camera"
-              />
-              <div className="flex justify-end gap-2 flex-shrink-0">
-                <Button variant="outline" onClick={() => setShowLaunchQuizDialog(false)}>
-                  Quiz ended? Close dialog
-                </Button>
+            <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-1">
+              <div className="grid md:grid-cols-2 gap-3 sm:gap-4">
+                <Card className="border-border">
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm font-display">Teacher Session QR</CardTitle>
+                  </CardHeader>
+                  <CardContent className="flex items-center justify-center">
+                    {liveQuizTeacherQr ? (
+                      <img
+                        src={liveQuizTeacherQr}
+                        alt="Live quiz session QR"
+                        className="w-[min(42vw,220px)] h-auto aspect-square rounded-md border border-border bg-white p-2"
+                      />
+                    ) : (
+                      <p className="text-xs text-muted-foreground">QR preview unavailable, scanning still works by manual input.</p>
+                    )}
+                  </CardContent>
+                </Card>
+                <Card className="border-border">
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm font-display">Capture Control</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <p className="text-xs text-muted-foreground">
+                      Connected devices: <span className="font-medium text-foreground">{liveQuizStatus?.connectedDevices ?? 0}</span>
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Attendance: <span className="font-medium text-foreground">{liveQuizStatus?.attendanceReady ? "Ready" : "Pending"}</span>
+                      {liveQuizStatus?.attendanceDate ? ` (${liveQuizStatus.attendanceDate})` : ""}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Capture status: <span className="font-medium text-foreground">{liveQuizStatus?.started ? "Started" : "Waiting to start"}</span>
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        variant={liveQuizCaptureMode === "manual" ? "default" : "outline"}
+                        onClick={() => setLiveQuizCaptureMode("manual")}
+                      >
+                        Teacher-only mode
+                      </Button>
+                      <Button
+                        variant={liveQuizCaptureMode === "qr" ? "default" : "outline"}
+                        onClick={() => setLiveQuizCaptureMode("qr")}
+                      >
+                        QR scanner mode
+                      </Button>
+                    </div>
+                    <Button onClick={handleStartLiveQuizCapture} disabled={!!liveQuizStatus?.started || !liveQuizStatus?.attendanceReady} className="w-full">
+                      {liveQuizStatus?.started ? "Capture started" : "Start quiz capture"}
+                    </Button>
+                    {liveQuizCaptureMode === "qr" && (liveQuizStatus?.connectedDevices ?? 0) < 1 && (
+                      <p className="text-[11px] text-muted-foreground">
+                        No scanner connected yet. You can still start capture; mobile can connect and submit after this.
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
+              <Card className="border-border min-h-0">
+                <CardHeader className="pb-2 flex flex-row items-center justify-between">
+                  <CardTitle className="text-sm font-display">Live Progress</CardTitle>
+                  <Button size="sm" variant="outline" onClick={handleEndLiveQuiz}>End Quiz</Button>
+                </CardHeader>
+                <CardContent className="space-y-3 max-h-[42dvh] sm:max-h-[46dvh] overflow-y-auto pb-2">
+                  {liveQuizCaptureMode === "manual" && (
+                    <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
+                      <p className="text-xs font-medium text-foreground">
+                        Teacher-only capture: tap one option per present student (no student device needed).
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        Eligible (present) students: <span className="font-medium text-foreground">{manualEligibleStudents.length}</span>
+                      </p>
+                      <div className="space-y-2 max-h-[22dvh] overflow-y-auto pr-1">
+                        {manualEligibleStudents.map((s) => {
+                          const picked = manualCurrentAnswers[s.id] || "";
+                          return (
+                            <div key={s.id} className="rounded-md border border-border p-2">
+                              <div className="flex items-center justify-between gap-2 mb-2">
+                                <p className="text-xs text-foreground font-medium">{s.rollNo}. {s.name}</p>
+                                <Badge variant="outline">{picked || "Not set"}</Badge>
+                              </div>
+                              <div className="grid grid-cols-4 gap-1">
+                                {(["A", "B", "C", "D"] as const).map((opt) => (
+                                  <Button
+                                    key={`${s.id}_${opt}`}
+                                    size="sm"
+                                    variant={picked === opt ? "default" : "outline"}
+                                    disabled={manualSubmittingStudentId === s.id}
+                                    onClick={() => handleManualSelectOption(s.id, opt)}
+                                  >
+                                    {opt}
+                                  </Button>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                        {manualEligibleStudents.length === 0 && (
+                          <p className="text-xs text-muted-foreground">No present students found. Submit attendance first.</p>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs text-muted-foreground">
+                          Current question completion: {Object.keys(manualCurrentAnswers).length}/{manualEligibleStudents.length}
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={manualQuestionNo <= 1}
+                            onClick={() => setManualQuestionNo((q) => Math.max(1, q - 1))}
+                          >
+                            Prev
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={manualQuestionNo >= (liveQuizSession?.questions.length || 1)}
+                            onClick={() => setManualQuestionNo((q) => Math.min((liveQuizSession?.questions.length || 1), q + 1))}
+                          >
+                            Next
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {liveQuizCurrentQuestion?.question && (
+                    <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
+                      <p className="text-[11px] font-semibold text-foreground uppercase tracking-wide">
+                        Question {liveQuizCurrentQuestion.index} of {liveQuizSession?.questions?.length ?? "—"}
+                      </p>
+                      <p className="text-sm text-foreground leading-snug">{liveQuizCurrentQuestion.question.questionText}</p>
+                      <ul className="text-xs text-muted-foreground space-y-1 grid gap-1 sm:grid-cols-2">
+                        <li>
+                          <span className="font-medium text-foreground">A.</span> {liveQuizCurrentQuestion.question.optionA}
+                        </li>
+                        <li>
+                          <span className="font-medium text-foreground">B.</span> {liveQuizCurrentQuestion.question.optionB}
+                        </li>
+                        <li>
+                          <span className="font-medium text-foreground">C.</span> {liveQuizCurrentQuestion.question.optionC}
+                        </li>
+                        <li>
+                          <span className="font-medium text-foreground">D.</span> {liveQuizCurrentQuestion.question.optionD}
+                        </li>
+                      </ul>
+                    </div>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Current question: <span className="font-medium text-foreground">{liveQuizStatus?.currentQuestionNo ?? 1}</span>
+                    {liveQuizStatus?.progressByQuestion?.[String(liveQuizStatus?.currentQuestionNo ?? 1)] != null
+                      ? ` (${liveQuizStatus?.progressByQuestion?.[String(liveQuizStatus?.currentQuestionNo ?? 1)]}/${liveQuizStatus?.students ?? 0})`
+                      : ""}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Answers captured: <span className="font-medium text-foreground">{liveQuizStatus?.answersCaptured ?? 0}</span> /{" "}
+                    <span className="font-medium text-foreground">{(liveQuizStatus?.questions ?? 0) * (liveQuizStatus?.students ?? 0)}</span>
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Final submit from mobile: <span className="font-medium text-foreground">{liveQuizStatus?.submitted ? "Done" : "Pending"}</span>
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Questions: <span className="font-medium text-foreground">{liveQuizStatus?.questions ?? 0}</span> • Students:{" "}
+                    <span className="font-medium text-foreground">{liveQuizStatus?.students ?? 0}</span>
+                  </p>
+                  <div className="pt-2 border-t border-border">
+                    <p className="text-xs font-medium text-foreground mb-2">Top scores (live)</p>
+                    <div className="flex flex-wrap gap-2">
+                      {liveQuizLeaderboard.map((e) => (
+                        <Badge key={e.studentId} variant="secondary">#{e.rank} {e.studentName}: {e.score}</Badge>
+                      ))}
+                      {liveQuizLeaderboard.length === 0 && <p className="text-xs text-muted-foreground">No submissions yet.</p>}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+              <div className="flex justify-end gap-2 flex-shrink-0 sticky bottom-0 bg-background/95 py-1">
+                <Button variant="outline" onClick={() => setShowLaunchQuizDialog(false)}>Close</Button>
               </div>
             </div>
           </DialogContent>
@@ -910,15 +1538,22 @@ const TeacherDashboard = () => {
                 )}
                 <div>
                   <h4 className="font-display font-semibold text-foreground text-sm mb-2">Topics (micro lesson plan)</h4>
+                  {sessionChapter && !isChapterInSyllabusThroughDecember(sessionChapter) && (
+                    <p className="text-xs text-muted-foreground mb-2">
+                      This chapter is after December in the annual plan — statuses show as &quot;Yet to complete&quot; until that term is active (same as the Chapters tab).
+                    </p>
+                  )}
                   <ul className="space-y-2">
                     {topics
-                      .filter((t) => t.chapterId === activeSession.chapterId)
+                      .filter((t) => sameId(t.chapterId, activeSession.chapterId))
                       .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
                       .map((t) => (
                         <li key={t.id} className="flex items-center gap-2 p-2 rounded-lg bg-secondary text-sm">
                           <span className="text-muted-foreground tabular-nums">{t.order}.</span>
                           <span className="font-medium text-foreground">{t.name}</span>
-                          <Badge variant="outline" className="text-[10px] ml-auto">{t.status}</Badge>
+                          <Badge variant="outline" className="text-[10px] ml-auto shrink-0">
+                            {displayTopicSyllabusLabel(sessionChapter, t.id, t.status, topicStatusState)}
+                          </Badge>
                           {(t as TopicLike).topicPptPath && (
                             <a
                               href={`${getApiBase()}/uploads/${(t as TopicLike).topicPptPath}`}
@@ -1029,6 +1664,7 @@ const TeacherDashboard = () => {
               <TabsTrigger value="chapters" className="justify-start w-full data-[state=active]:bg-secondary data-[state=active]:text-primary hover:bg-secondary/50 rounded-lg px-4 py-2 transition-colors">Chapters & Topics</TabsTrigger>
               <TabsTrigger value="students" className="justify-start w-full data-[state=active]:bg-secondary data-[state=active]:text-primary hover:bg-secondary/50 rounded-lg px-4 py-2 transition-colors">Students</TabsTrigger>
               <TabsTrigger value="classstatus" className="justify-start w-full data-[state=active]:bg-secondary data-[state=active]:text-primary hover:bg-secondary/50 rounded-lg px-4 py-2 transition-colors">Class Status</TabsTrigger>
+              <TabsTrigger value="timetable" className="justify-start w-full data-[state=active]:bg-secondary data-[state=active]:text-primary hover:bg-secondary/50 rounded-lg px-4 py-2 transition-colors">Timetable</TabsTrigger>
               <TabsTrigger value="leave" className="justify-start w-full data-[state=active]:bg-secondary data-[state=active]:text-primary hover:bg-secondary/50 rounded-lg px-4 py-2 transition-colors">Leave</TabsTrigger>
               <TabsTrigger value="cocurricular" className="justify-start w-full data-[state=active]:bg-secondary data-[state=active]:text-primary hover:bg-secondary/50 rounded-lg px-4 py-2 transition-colors">Co-Curricular</TabsTrigger>
             </TabsList>
@@ -1098,15 +1734,82 @@ const TeacherDashboard = () => {
           </Card>
         </TabsContent>
 
+        <TabsContent value="timetable" className="space-y-4">
+          <Card className="shadow-card border-border">
+            <CardHeader>
+              <CardTitle className="font-display text-lg flex items-center gap-2">
+                <Clock className="w-5 h-5 text-primary" /> Class Timetable
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xs text-muted-foreground mb-3">
+                School starts at 9:00 AM. Period duration: 40 mins. Breaks: 10:20-10:35 and 2:20-2:35. Lunch: 11:55-1:00.
+              </p>
+              {(() => {
+                const dayNames: Record<number, string> = { 1: "Monday", 2: "Tuesday", 3: "Wednesday", 4: "Thursday", 5: "Friday", 6: "Saturday" };
+                const rows = timetables
+                  .filter((t) => t.classId === selectedClass)
+                  .filter((t) => (t.subjectId ? t.subjectId === selectedSubject : false))
+                  .sort((a, b) => (a.weekDay - b.weekDay) || (a.periodNo - b.periodNo));
+                if (!rows.length) return <p className="text-sm text-muted-foreground">No timetable slots mapped for your subject in this class.</p>;
+                const periods = [1, 2, 3, 4, 5, 6, 7, 8];
+                const grid = new Map<string, { subjectName: string; startTime: string; endTime: string }>();
+                rows.forEach((r) => {
+                  grid.set(`${r.weekDay}-${r.periodNo}`, { subjectName: r.subjectName, startTime: r.startTime, endTime: r.endTime });
+                });
+                return (
+                  <div className="overflow-x-auto rounded-lg border border-border">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="bg-secondary border-b border-border">
+                          <th className="p-2 text-left font-medium">Day \\ Period</th>
+                          {periods.map((p) => <th key={p} className="p-2 text-left font-medium">P{p}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[1, 2, 3, 4, 5, 6].map((day) => (
+                          <tr key={day} className="border-b border-border last:border-0">
+                            <td className="p-2 font-semibold text-foreground">{dayNames[day]}</td>
+                            {periods.map((p) => {
+                              const slot = grid.get(`${day}-${p}`);
+                              return (
+                                <td key={`${day}-${p}`} className="p-2 align-top">
+                                  {slot ? (
+                                    <div className="rounded-md bg-teal-light px-2 py-1.5">
+                                      <p className="font-medium text-foreground">{slot.subjectName}</p>
+                                      <p className="text-[10px] text-muted-foreground">{String(slot.startTime).slice(0, 5)}-{String(slot.endTime).slice(0, 5)}</p>
+                                    </div>
+                                  ) : (
+                                    <span className="text-muted-foreground">-</span>
+                                  )}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
         <TabsContent value="chapters" className="space-y-4">
           <h3 className="font-display text-lg font-bold text-foreground flex items-center gap-2">
             {currentSubject?.icon} {currentSubject?.name} — {currentClass?.name}
           </h3>
           <div className="space-y-3">
             {[...filteredChapters].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)).map((ch) => {
-              const status = chapterStatusState[ch.id] || "not_started";
-              const sc = statusColors[status as keyof typeof statusColors];
-              const chTopics = topics.filter((t) => t.chapterId === ch.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+              const chTopics = topics.filter((t) => sameId(t.chapterId, ch.id)).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+              const inSyllabusScope = isChapterInSyllabusThroughDecember(ch);
+              const status: keyof typeof statusColors = !inSyllabusScope
+                ? "future_syllabus"
+                : chTopics.length > 0
+                  ? deriveChapterStatusKey(chTopics, topicStatusState)
+                  : normalizeTopicStatus(chapterStatusState[String(ch.id)]);
+              const sc = statusColors[status];
               const progress = getChapterProgress(ch.id);
               const isExpanded = selectedChapter === ch.id;
 
@@ -1123,7 +1826,9 @@ const TeacherDashboard = () => {
                         <h4 className="font-display font-semibold text-foreground text-sm">{ch.name}</h4>
                         <div className="flex items-center gap-3 mt-1">
                           <Badge className={`${sc.bg} ${sc.text} text-xs`}>{sc.label}</Badge>
-                          <span className="text-xs text-muted-foreground">{chTopics.length} topics</span>
+                          <span className="text-xs text-muted-foreground">
+                            {chTopics.length} {chTopics.length === 1 ? "topic" : "topics"}
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -1140,8 +1845,9 @@ const TeacherDashboard = () => {
                   {isExpanded && (
                     <div className="border-t border-border bg-secondary/30 p-4 space-y-2">
                       {chTopics.length > 0 ? chTopics.map((topic) => {
-                        const tStatus = topicStatusState[topic.id] || topic.status;
-                        const tsc = statusColors[tStatus as keyof typeof statusColors];
+                        const tStatusRaw = topicStatusState[String(topic.id)] || topic.status;
+                        const tNorm = !inSyllabusScope ? "not_started" : normalizeTopicStatus(tStatusRaw);
+                        const tsc = statusColors[tNorm];
                         const isTopicExpanded = expandedTopics[topic.id];
 
                         return (
@@ -1151,9 +1857,9 @@ const TeacherDashboard = () => {
                               onClick={() => toggleTopic(topic.id)}
                             >
                               <div className="flex items-center gap-2">
-                                {tStatus === "completed" ? (
+                                {tNorm === "completed" ? (
                                   <CheckCircle2 className="w-4 h-4 text-success flex-shrink-0" />
-                                ) : tStatus === "in_progress" ? (
+                                ) : tNorm === "in_progress" ? (
                                   <Clock className="w-4 h-4 text-amber flex-shrink-0" />
                                 ) : (
                                   <div className="w-4 h-4 rounded-full border-2 border-border flex-shrink-0" />

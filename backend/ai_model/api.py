@@ -1,4 +1,5 @@
 """AI API entry: CORS, .env, and chatbot + recommendations routers."""
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -28,6 +29,19 @@ app.add_middleware(
 
 app.include_router(chatbot_router)
 app.include_router(recommendations_router)
+
+
+def _validate_ai_env() -> None:
+    yt_key = (os.environ.get("YOUTUBE_API_KEY") or "").strip()
+    require_yt = (os.environ.get("REQUIRE_YOUTUBE_API") or "").strip().lower() == "true"
+    if not yt_key:
+        msg = "[ai_model] YOUTUBE_API_KEY is not set. Recommendations will use web-search fallback."
+        if require_yt:
+            raise RuntimeError(f"{msg} Set YOUTUBE_API_KEY in backend/ai_model/.env or unset REQUIRE_YOUTUBE_API.")
+        print(msg)
+
+
+_validate_ai_env()
 
 
 @app.get("/health")

@@ -11,6 +11,7 @@ An educational platform for managing student learning activities, quizzes, and p
 - **`database/`** – SQL scripts and schema (e.g. `railway_core_schema.sql`).
 
 Config files (Vite, Tailwind, TypeScript, etc.) stay at the repository root; Vite is configured with `root: "frontend"`. The canonical AI code lives in `backend/ai_model` only.
+Legacy folders such as `AI/` and `teacher-quiz-app/` are retained for reference; production/runtime paths should continue using `backend/ai_model` and `backend/server`.
 
 ## Project Overview
 
@@ -61,6 +62,19 @@ npm run dev
 
 The application will be available at `http://localhost:8080`.
 
+### AI service (for dynamic recommendations + chatbot)
+
+Run this in a second terminal:
+```
+cd backend/ai_model
+python -m uvicorn api:app --reload --port 8000
+```
+
+Recommended env values:
+- Root `.env`: `VITE_AI_API_URL=http://127.0.0.1:8000`
+- `backend/ai_model/.env`: `YOUTUBE_API_KEY=...` (optional but improves recommendation quality)
+- Optional strict mode: `REQUIRE_YOUTUBE_API=true` to fail AI startup when key is missing
+
 ### Building for Production
 
 ```
@@ -74,6 +88,12 @@ npm run build
 sh
 npm run test
 ```
+
+### Stack Verification Commands
+
+- `npm run verify:ai` — checks AI health, `/recommend`, and `/ask`
+- `npm run verify:live-quiz` — checks API/DB + live-quiz schema readiness
+- `npm run verify:system` — unified preflight (API + DB + live-quiz schema + AI)
 
 ## Features
 

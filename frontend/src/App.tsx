@@ -13,6 +13,7 @@ import TeacherDashboard from "./pages/teacher/TeacherDashboard";
 import TeacherSetup from "./pages/teacher/TeacherSetup";
 import LessonScreen from "./pages/teacher/LessonScreen";
 import QuizScreen from "./pages/teacher/QuizScreen";
+import LiveQuizScan from "./pages/teacher/LiveQuizScan";
 import AdminDashboard from "./pages/admin/AdminDashboard";
 import SchoolsAnalytics from "./pages/admin/SchoolsAnalytics";
 import StudentsFilter from "./pages/admin/StudentsFilter";
@@ -22,9 +23,11 @@ import StudentSubjects from "./pages/student/StudentSubjects";
 import StudentQuiz from "./pages/student/StudentQuiz";
 import StudentQuizResults from "./pages/student/StudentQuizResults";
 import StudentLiveQuiz from "./pages/student/StudentLiveQuiz";
+import StudentQrProfile from "./pages/student/StudentQrProfile";
 import NotFound from "./pages/NotFound";
 import StudentRegistration from "./pages/admin/StudentRegistration";
 import TeacherRegistration from "./pages/admin/TeacherRegistration";
+import MvpSubmissionHub from "./pages/MvpSubmissionHub";
 
 const queryClient = new QueryClient();
 
@@ -39,12 +42,14 @@ const App = () => (
           <Routes>
             <Route path="/" element={<Index />} />
             <Route path="/login" element={<Login />} />
+            <Route path="/mvp" element={<MvpSubmissionHub />} />
             <Route path="/about" element={<About />} />
             <Route path="/activities" element={<Activities />} />
             <Route path="/teacher/setup" element={<TeacherSetup />} />
             <Route path="/teacher" element={<TeacherDashboard />} />
             <Route path="/teacher/lesson" element={<LessonScreen />} />
             <Route path="/teacher/quiz" element={<QuizScreen />} />
+            <Route path="/teacher/live-quiz-scan" element={<LiveQuizScan />} />
             <Route path="/admin" element={<AdminDashboard />} />
             <Route path="/admin/schools-analytics" element={<SchoolsAnalytics />} />
             <Route path="/admin/students-filter" element={<StudentsFilter />} />
@@ -56,6 +61,7 @@ const App = () => (
             <Route path="/student/quiz" element={<StudentQuiz />} />
             <Route path="/student/quiz-results" element={<StudentQuizResults />} />
             <Route path="/student/live-quiz/:sessionId" element={<StudentLiveQuiz />} />
+            <Route path="/student/qr/:token" element={<StudentQrProfile />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>

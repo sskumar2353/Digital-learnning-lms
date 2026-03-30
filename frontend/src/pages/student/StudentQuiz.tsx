@@ -1,4 +1,5 @@
 import { useState, useMemo } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import DashboardLayout from "@/components/DashboardLayout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,7 +11,13 @@ import {
 } from "lucide-react";
 import { useAppData } from "@/contexts/DataContext";
 
+const LEVEL_LABELS: Record<string, string> = { low: "Low", medium: "Medium", high: "High" };
+
 const StudentQuiz = () => {
+  const [searchParams] = useSearchParams();
+  const quizLevelRaw = (searchParams.get("level") || searchParams.get("rate") || "").toLowerCase();
+  const quizLevelLabel = LEVEL_LABELS[quizLevelRaw] || null;
+
   const { studentId } = useAuth();
   const { data } = useAppData();
   const { subjects, chapters, chapterQuizzes, students, classes, studentQuizResults } = data;
@@ -125,12 +132,20 @@ const StudentQuiz = () => {
         <Button variant="ghost" onClick={handleBack} className="mb-4 gap-1">
           <ArrowLeft className="w-4 h-4" /> Exit Quiz
         </Button>
+        {quizLevelLabel && (
+          <p className="text-xs text-muted-foreground mb-2 max-w-2xl mx-auto">
+            Quiz rate (demo): <Badge variant="secondary">{quizLevelLabel}</Badge> — same question set; full tiered banks can plug in later.
+          </p>
+        )}
 
         <Card className="shadow-card border-border max-w-2xl mx-auto">
           <CardHeader>
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between flex-wrap gap-2">
               <CardTitle className="font-display text-sm">Question {currentQ + 1} of {questions.length}</CardTitle>
-              <Badge variant="outline">{Object.keys(answers).length}/{questions.length} answered</Badge>
+              <div className="flex items-center gap-2">
+                {quizLevelLabel && <Badge variant="outline">Rate: {quizLevelLabel}</Badge>}
+                <Badge variant="outline">{Object.keys(answers).length}/{questions.length} answered</Badge>
+              </div>
             </div>
             <Progress value={((currentQ + 1) / questions.length) * 100} className="h-2" />
           </CardHeader>
@@ -181,6 +196,12 @@ const StudentQuiz = () => {
   // Subject/chapter selection
   return (
     <DashboardLayout title="Chapter-wise Quizzes">
+      {quizLevelLabel && (
+        <div className="mb-4 flex items-center gap-2 text-sm text-muted-foreground">
+          <span>Selected quiz rate:</span>
+          <Badge>{quizLevelLabel}</Badge>
+        </div>
+      )}
       {!selectedSubject ? (
         <>
           <h2 className="font-display text-xl font-bold text-foreground mb-4">📝 Select Subject for Quiz</h2>

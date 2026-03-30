@@ -18,6 +18,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import StudentQRCard from "@/components/StudentQRCard";
+import PptxViewer from "@/components/PptxViewer";
 import { useAppData } from "@/contexts/DataContext";
 import { useAuth } from "@/contexts/AuthContext";
 import {
@@ -63,6 +64,7 @@ const AdminDashboard = () => {
     curriculum,
     studentUsageLogs,
     admins,
+    timetables,
   } = data;
 
   const curriculumTyped = (curriculum as {
@@ -72,6 +74,63 @@ const AdminDashboard = () => {
   const syllabusByChapter = curriculumTyped.syllabusByChapter ?? {};
 
   const adminDisplayName = (authRole === "admin" && userName) ? userName : ((admins?.length && isFromApi) ? (admins[0]?.full_name || userName) : userName);
+  const resolveUploadUrl = (p?: string | null) => {
+    const raw = (p || "").trim();
+    if (!raw) return "";
+    if (/^https?:\/\//i.test(raw)) return raw;
+    const normalized = raw.replace(/^\/+/, "");
+    if (normalized.startsWith("uploads/")) return `${getApiBase()}/${normalized}`;
+    return `${getApiBase()}/uploads/${normalized}`;
+  };
+  const toPreviewUrl = (url: string) => {
+    const raw = (url || "").trim();
+    if (!raw) return "";
+    return raw;
+  };
+  const isPptxUrl = (url: string) => /\.(ppt|pptx)(\?|#|$)/i.test((url || "").trim());
+
+  const openMaterialPreviewSafe = useCallback(
+    async (args: { title: string; previewUrl: string; fallbackUrl?: string; previewType?: "iframe" | "pptx" }) => {
+      const { title, previewUrl, fallbackUrl, previewType = "iframe" } = args;
+      if (!previewUrl) return;
+
+      setMaterialPreview({
+        open: true,
+        title,
+        url: previewUrl,
+        fallbackUrl,
+        previewType,
+      });
+
+      if (previewType === "pptx") return;
+
+      try {
+        // HEAD will be ok only when the server can serve the preview file (PDF converted).
+        const r = await fetch(previewUrl, { method: "HEAD" });
+        if (!r.ok) {
+          setMaterialPreview({
+            open: true,
+            title,
+            url: "",
+            fallbackUrl: fallbackUrl || previewUrl,
+            previewType: "message",
+            message:
+              "Preview is not available for this file (PDF conversion missing or failed). Please open in a new tab instead.",
+          });
+        }
+      } catch (_) {
+        setMaterialPreview({
+          open: true,
+          title,
+          url: "",
+          fallbackUrl: fallbackUrl || previewUrl,
+          previewType: "message",
+          message: "Preview is not available for this file (network or conversion issue). Please open in a new tab instead.",
+        });
+      }
+    },
+    []
+  );
 
   const overviewChartData = useMemo(() => {
     const schoolClassIds = new Map<string, string[]>();
@@ -202,6 +261,10 @@ const AdminDashboard = () => {
     return () => document.removeEventListener("click", handleDocClick);
   }, []);
 
+  const [selectedTimetableSchool, setSelectedTimetableSchool] = useState<string | null>(null);
+  const [selectedTimetableClass, setSelectedTimetableClass] = useState<number | null>(null);
+  const [selectedTimetableSection, setSelectedTimetableSection] = useState<string | null>(null);
+
   const [editingTeacherId, setEditingTeacherId] = useState<string | null>(null);
   const [teacherEditSchoolId, setTeacherEditSchoolId] = useState("");
   const [teacherEditAssignments, setTeacherEditAssignments] = useState<Array<{ classId: string; subjectId: string; schoolId: string }>>([]);
@@ -238,6 +301,14 @@ const AdminDashboard = () => {
   const [logTeacherFilter, setLogTeacherFilter] = useState("all");
   const [logTeacherIdFilter, setLogTeacherIdFilter] = useState("");
   const [showLiveSessionsDialog, setShowLiveSessionsDialog] = useState(false);
+  const [materialPreview, setMaterialPreview] = useState<{
+    open: boolean;
+    title: string;
+    url: string;
+    fallbackUrl?: string;
+    previewType?: "iframe" | "pptx" | "message";
+    message?: string;
+  }>({ open: false, title: "", url: "", previewType: "iframe" });
   const navigate = useNavigate();
 
   const overviewCards = [
@@ -265,11 +336,11 @@ const AdminDashboard = () => {
         const percent = totalPossible > 0 ? Math.round((totalScore / totalPossible) * 100) : 0;
         return { name: sub.name, percent };
       });
-  }, [classDetail, selectedClass, classStudents]);
+  }, [classDetail, selectedClass, classStudents, subjects, chapters, studentQuizResults]);
 
   const schoolFilteredTeachers = useMemo(
     () => teachers.filter(t => teacherSchoolFilter === "all" || t.schoolId === teacherSchoolFilter),
-    [teacherSchoolFilter]
+    [teachers, teacherSchoolFilter]
   );
 
   const teacherSubjectOptions = useMemo(
@@ -291,7 +362,7 @@ const AdminDashboard = () => {
         if (teacherNameFilter !== "all" && teacher.id !== teacherNameFilter) return false;
         return true;
       });
-  }, [teacherSchoolFilter, teacherSubjectFilter, teacherNameFilter]);
+  }, [teacherEffectiveness, teachers, teacherSchoolFilter, teacherSubjectFilter, teacherNameFilter]);
 
   const downloadAllQRCards = useCallback(() => {
     if (!classStudents.length || !school || !classDetail) return;
@@ -597,6 +668,7 @@ const AdminDashboard = () => {
             )}
           </div>
           <TabsTrigger value="leave">Leave</TabsTrigger>
+          <TabsTrigger value="timetable">Timetable</TabsTrigger>
           <TabsTrigger value="materials">Materials</TabsTrigger>
           <TabsTrigger value="classstatus">Class Status</TabsTrigger>
           <TabsTrigger value="logs">Logs</TabsTrigger>
@@ -797,6 +869,16 @@ const AdminDashboard = () => {
               </div>
               <div className="grid md:grid-cols-2 gap-4">
               {schools.map(s => {
+                const schoolClasses = classes.filter(c => c.schoolId === s.id);
+                const schoolClassIds = new Set(schoolClasses.map((c) => c.id));
+                const schoolStudentIds = new Set(students.filter((st) => st.classId && schoolClassIds.has(st.classId)).map((st) => st.id));
+                const schoolAttendance = studentAttendance.filter((a) => schoolStudentIds.has(a.studentId));
+                const engagementPct = schoolAttendance.length ? Math.round(schoolAttendance.reduce((sum, a) => sum + a.percentage, 0) / schoolAttendance.length) : 0;
+                const schoolResults = studentQuizResults.filter((r) => schoolStudentIds.has(r.studentId));
+                const totalSc = schoolResults.reduce((sum, r) => sum + r.score, 0);
+                const totalTot = schoolResults.reduce((sum, r) => sum + r.total, 0);
+                const performancePct = totalTot > 0 ? Math.round((totalSc / totalTot) * 100) : 0;
+                const completionPct = s.sessionsCompleted > 0 ? Math.min(100, Math.round((schoolResults.length / s.sessionsCompleted) * 10)) : 0;
                 const schoolSessions = activeSessions.filter(ls =>
                   classes.filter(c => c.schoolId === s.id).some(c => c.id === ls.classId)
                 );
@@ -819,15 +901,15 @@ const AdminDashboard = () => {
                           </div>
                           <div className="grid grid-cols-3 gap-2 mt-3">
                             <div className="bg-secondary rounded-lg p-2 text-center">
-                              <p className="font-display text-sm font-bold text-foreground">85%</p>
+                              <p className="font-display text-sm font-bold text-foreground">{engagementPct}%</p>
                               <p className="text-[10px] text-muted-foreground">Engagement</p>
                             </div>
                             <div className="bg-secondary rounded-lg p-2 text-center">
-                              <p className="font-display text-sm font-bold text-foreground">72%</p>
+                              <p className="font-display text-sm font-bold text-foreground">{completionPct}%</p>
                               <p className="text-[10px] text-muted-foreground">Completion</p>
                             </div>
                             <div className="bg-secondary rounded-lg p-2 text-center">
-                              <p className="font-display text-sm font-bold text-foreground">78%</p>
+                              <p className="font-display text-sm font-bold text-foreground">{performancePct}%</p>
                               <p className="text-[10px] text-muted-foreground">Performance</p>
                             </div>
                           </div>
@@ -946,7 +1028,15 @@ const AdminDashboard = () => {
               {showQRCards ? (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 justify-items-center">
                   {classStudents.map(s => (
-                    <StudentQRCard key={s.id} student={s} schoolName={school?.name || ""} className={classDetail?.name || ""} />
+                    <StudentQRCard
+                      key={s.id}
+                      student={s}
+                      schoolName={school?.name || ""}
+                      schoolCode={school?.code || ""}
+                      className={classDetail?.name || ""}
+                      grade={classDetail?.grade ?? null}
+                      section={s.section || ""}
+                    />
                   ))}
                 </div>
               ) : (
@@ -1347,6 +1437,106 @@ const AdminDashboard = () => {
           </Card>
         </TabsContent>
 
+        <TabsContent value="timetable" className="space-y-4">
+          <Card className="shadow-card border-border">
+            <CardHeader>
+              <CardTitle className="font-display text-lg flex items-center gap-2">
+                <Clock className="w-5 h-5 text-primary" /> Class Timetables
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <p className="text-xs text-muted-foreground">
+                8 periods/day. Breaks: 10:20-10:35 and 2:20-2:35. Lunch: 11:55-1:00.
+              </p>
+              {!selectedTimetableSchool && (
+                <div>
+                  <p className="text-sm text-muted-foreground mb-3">School → Class → Section → Time table</p>
+                  <div className="grid md:grid-cols-2 gap-3">
+                    {schools.map((s) => (
+                      <Card key={s.id} className="shadow-card border-border card-hover cursor-pointer" onClick={() => { setSelectedTimetableSchool(s.id); setSelectedTimetableClass(null); setSelectedTimetableSection(null); }}>
+                        <CardContent className="p-4"><p className="font-medium">{s.name}</p></CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {selectedTimetableSchool && selectedTimetableClass == null && (
+                <div>
+                  <Button variant="ghost" onClick={() => setSelectedTimetableSchool(null)} className="mb-3">← Back to Schools</Button>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {Array.from(new Set(classes.filter((c) => c.schoolId === selectedTimetableSchool).map((c) => c.grade))).sort((a, b) => a - b).map((g) => (
+                      <Card key={g} className="shadow-card border-border card-hover cursor-pointer" onClick={() => { setSelectedTimetableClass(g); setSelectedTimetableSection(null); }}>
+                        <CardContent className="p-4 text-center"><span className="font-semibold">Class {g}</span></CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {selectedTimetableSchool && selectedTimetableClass != null && !selectedTimetableSection && (
+                <div>
+                  <Button variant="ghost" onClick={() => setSelectedTimetableClass(null)} className="mb-3">← Back to Classes</Button>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {classes.filter((c) => c.schoolId === selectedTimetableSchool && c.grade === selectedTimetableClass).map((c) => (
+                      <Card key={c.id} className="shadow-card border-border card-hover cursor-pointer" onClick={() => setSelectedTimetableSection(c.id)}>
+                        <CardContent className="p-4 text-center"><span className="font-semibold">Section {c.section}</span></CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {selectedTimetableSchool && selectedTimetableClass != null && selectedTimetableSection && (
+                <div>
+                  <Button variant="ghost" onClick={() => setSelectedTimetableSection(null)} className="mb-3">← Back to Sections</Button>
+                  {(() => {
+                    const cls = classes.find((c) => c.id === selectedTimetableSection);
+                    const rows = (timetables as Array<{ classId: string; weekDay: number; periodNo: number; subjectName: string; teacherId?: string | null; startTime: string; endTime: string }>)
+                      .filter((t) => t.classId === selectedTimetableSection)
+                      .sort((a, b) => (a.weekDay - b.weekDay) || (a.periodNo - b.periodNo));
+                    if (!rows.length) return <p className="text-sm text-muted-foreground">No timetable found for this section.</p>;
+                    const dayNames: Record<number, string> = { 1: "Monday", 2: "Tuesday", 3: "Wednesday", 4: "Thursday", 5: "Friday", 6: "Saturday" };
+                    return (
+                      <div className="rounded-lg border border-border p-3">
+                        <p className="text-sm font-semibold text-foreground mb-2">{cls?.name}</p>
+                        <div className="overflow-x-auto rounded-md border border-border">
+                          <table className="w-full text-[11px]">
+                            <thead>
+                              <tr className="bg-secondary border-b border-border">
+                                <th className="p-2 text-left font-medium">Day \\ Period</th>
+                                {[1, 2, 3, 4, 5, 6, 7, 8].map((p) => <th key={`tt-p-${p}`} className="p-2 text-left font-medium">P{p}</th>)}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {[1, 2, 3, 4, 5, 6].map((d) => (
+                                <tr key={`tt-d-${d}`} className="border-b border-border last:border-0">
+                                  <td className="p-2 font-semibold">{dayNames[d]}</td>
+                                  {[1, 2, 3, 4, 5, 6, 7, 8].map((p) => {
+                                    const r = rows.find((x) => x.weekDay === d && x.periodNo === p);
+                                    const t = r ? teachers.find((x) => x.id === (r.teacherId || "")) : null;
+                                    return (
+                                      <td key={`tt-${d}-${p}`} className="p-2 align-top">
+                                        {r ? (
+                                          <div className="rounded bg-secondary px-1.5 py-1">
+                                            <p className="font-medium">{r.subjectName}</p>
+                                            <p className="text-[10px] text-muted-foreground">{t?.name || "Teacher not mapped"}</p>
+                                          </div>
+                                        ) : <span className="text-muted-foreground">-</span>}
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
         {/* MATERIALS */}
         <TabsContent value="materials" className="space-y-4">
           <Card className="shadow-card border-border">
@@ -1430,7 +1620,23 @@ const AdminDashboard = () => {
                             <p className="text-xs text-muted-foreground mb-2">
                               Current: {(ch as { textbookChunkPdfPath: string }).textbookChunkPdfPath}
                               {" · "}
-                              <a href={`${getApiBase()}/uploads/${(ch as { textbookChunkPdfPath: string }).textbookChunkPdfPath}`} target="_blank" rel="noreferrer" className="text-primary hover:underline">View</a>
+                              <button
+                                type="button"
+                                className="text-primary hover:underline"
+                                onClick={() => {
+                                  const previewUrl = toPreviewUrl(
+                                    resolveUploadUrl((ch as { textbookChunkPdfPath: string }).textbookChunkPdfPath)
+                                  );
+                                  if (!previewUrl) return;
+                                  void openMaterialPreviewSafe({
+                                    title: `${ch?.name || "Chapter"} - Textbook`,
+                                    previewUrl,
+                                    fallbackUrl: previewUrl,
+                                  });
+                                }}
+                              >
+                                View
+                              </button>
                             </p>
                           )}
                           <input
@@ -1444,18 +1650,20 @@ const AdminDashboard = () => {
                               const file = e.target.files[0];
                               setUploadingTextbookFor(chapterId);
                               try {
-                                const base64 = await new Promise<string>((resolve, reject) => {
-                                  const r = new FileReader();
-                                  r.onload = () => { const s = (r.result as string)?.split(",")?.[1]; resolve(s || ""); };
-                                  r.onerror = reject;
-                                  r.readAsDataURL(file);
+                                const base64 = await file.arrayBuffer().then((buf) => {
+                                  let binary = "";
+                                  const bytes = new Uint8Array(buf);
+                                  const chunk = 0x8000;
+                                  for (let i = 0; i < bytes.length; i += chunk) {
+                                    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+                                  }
+                                  return btoa(binary);
                                 });
                                 if (!base64) throw new Error("Failed to read file");
                                 await updateChapterTextbook(chapterId, { file: base64, filename: file.name });
                                 refetch?.();
                                 toast.success("Textbook uploaded and saved.");
                               } catch (err) {
-                                console.error(err);
                                 toast.error(err instanceof Error ? err.message : "Upload failed. File may be too large or server error.");
                               } finally {
                                 setUploadingTextbookFor(null);
@@ -1501,8 +1709,38 @@ const AdminDashboard = () => {
                               <p className="text-xs text-muted-foreground mt-1">Status: {t.status}</p>
                               <div className="mt-2 flex flex-wrap items-center gap-2">
                                 {(t as { topicPptPath?: string | null }).topicPptPath && (
-                                  <a href={`${getApiBase()}/uploads/${(t as { topicPptPath: string }).topicPptPath}`} target="_blank" rel="noreferrer" className="text-xs text-primary hover:underline">View PPT</a>
+                                  <button
+                                    type="button"
+                                    className="text-xs text-primary hover:underline"
+                                    onClick={() => {
+                                      const originalUrl = resolveUploadUrl((t as { topicPptPath: string }).topicPptPath);
+                                      const previewUrl = toPreviewUrl(originalUrl);
+                                      if (!previewUrl) return;
+                                      void openMaterialPreviewSafe({
+                                        title: `${t.name} - PPT`,
+                                        previewUrl,
+                                        fallbackUrl: originalUrl,
+                                        previewType: isPptxUrl(originalUrl) ? "pptx" : "iframe",
+                                      });
+                                    }}
+                                  >
+                                    View PPT
+                                  </button>
                                 )}
+                                {(t as { microLessons?: Array<{ id: string; periodNo: number; conceptText: string; planText: string }> }).microLessons?.length ? (
+                                  <details className="w-full mt-1">
+                                    <summary className="text-xs text-primary cursor-pointer">View micro lesson plan</summary>
+                                    <div className="mt-2 space-y-2">
+                                      {(t as { microLessons: Array<{ id: string; periodNo: number; conceptText: string; planText: string }> }).microLessons.map((ml) => (
+                                        <div key={ml.id} className="rounded border border-border/70 bg-background p-2">
+                                          <p className="text-xs font-medium text-foreground">Period {ml.periodNo}</p>
+                                          {ml.conceptText ? <p className="text-xs text-muted-foreground mt-1">Concept: {ml.conceptText}</p> : null}
+                                          {ml.planText ? <p className="text-xs text-muted-foreground mt-1 whitespace-pre-wrap">{ml.planText}</p> : null}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </details>
+                                ) : null}
                                 <input
                                   type="file"
                                   accept=".ppt,.pptx,.pdf"
@@ -1513,18 +1751,20 @@ const AdminDashboard = () => {
                                     const file = e.target.files[0];
                                     setUploadingPptFor(t.id);
                                     try {
-                                      const base64 = await new Promise<string>((resolve, reject) => {
-                                        const r = new FileReader();
-                                        r.onload = () => { const s = (r.result as string)?.split(",")?.[1]; resolve(s || ""); };
-                                        r.onerror = reject;
-                                        r.readAsDataURL(file);
+                                      const base64 = await file.arrayBuffer().then((buf) => {
+                                        let binary = "";
+                                        const bytes = new Uint8Array(buf);
+                                        const chunk = 0x8000;
+                                        for (let i = 0; i < bytes.length; i += chunk) {
+                                          binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+                                        }
+                                        return btoa(binary);
                                       });
                                       if (!base64) throw new Error("Failed to read file");
                                       await updateTopicPpt(t.id, { file: base64, filename: file.name });
                                       refetch?.();
                                       toast.success("PPT uploaded and saved.");
                                     } catch (err) {
-                                      console.error(err);
                                       toast.error(err instanceof Error ? err.message : "Upload failed. File may be too large or server error.");
                                     } finally {
                                       setUploadingPptFor(null);
@@ -1608,8 +1848,20 @@ const AdminDashboard = () => {
                           if (!cls || cls.schoolId !== classStatusSchoolFilter) return false;
                         }
                         if (classStatusClassFilter !== "all" && cs.classId !== classStatusClassFilter) return false;
-                        return true;
+                        const d = new Date(String(cs.date || "").slice(0, 10));
+                        if (Number.isNaN(d.getTime())) return false;
+                        const today = new Date();
+                        today.setHours(0, 0, 0, 0);
+                        const tenDaysAgo = new Date(today);
+                        tenDaysAgo.setDate(today.getDate() - 9);
+                        return d >= tenDaysAgo && d <= today;
                       })
+                      .sort((a, b) => {
+                        const da = new Date(String(a.date || "").slice(0, 10)).getTime();
+                        const db = new Date(String(b.date || "").slice(0, 10)).getTime();
+                        return db - da;
+                      })
+                      .slice(0, 10)
                       .map(cs => {
                         const cls = classes.find(c => c.id === cs.classId);
                         const teacher = teachers.find(t => t.id === cs.teacherId);
@@ -1645,6 +1897,27 @@ const AdminDashboard = () => {
                           </tr>
                         );
                       })}
+                    {combinedClassStatus
+                      .filter(cs => {
+                        if (classStatusSchoolFilter !== "all") {
+                          const cls = classes.find(c => c.id === cs.classId);
+                          if (!cls || cls.schoolId !== classStatusSchoolFilter) return false;
+                        }
+                        if (classStatusClassFilter !== "all" && cs.classId !== classStatusClassFilter) return false;
+                        const d = new Date(String(cs.date || "").slice(0, 10));
+                        if (Number.isNaN(d.getTime())) return false;
+                        const today = new Date();
+                        today.setHours(0, 0, 0, 0);
+                        const tenDaysAgo = new Date(today);
+                        tenDaysAgo.setDate(today.getDate() - 9);
+                        return d >= tenDaysAgo && d <= today;
+                      }).length === 0 && (
+                        <tr>
+                          <td colSpan={6} className="p-6 text-center text-sm text-muted-foreground">
+                            No class status rows in the last 10 days for current filters.
+                          </td>
+                        </tr>
+                      )}
                   </tbody>
                 </table>
               </div>
@@ -1821,6 +2094,75 @@ const AdminDashboard = () => {
               </div>
             );
           })()}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={materialPreview.open}
+        onOpenChange={(open) => setMaterialPreview((prev) => ({ ...prev, open }))}
+      >
+        <DialogContent className="max-w-6xl p-0 overflow-hidden">
+          <div className="p-5 border-b border-border">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="font-display text-2xl font-semibold text-foreground truncate">
+                {materialPreview.title || "Material Preview"}
+              </h3>
+              {(materialPreview.fallbackUrl || materialPreview.url) ? (
+                <a
+                  href={materialPreview.fallbackUrl || materialPreview.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs text-primary hover:underline whitespace-nowrap"
+                >
+                  Open in new tab
+                </a>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="p-5">
+            <div className="rounded-xl border border-border overflow-hidden bg-background h-[68vh]">
+              {materialPreview.previewType === "message" ? (
+                <div className="h-full flex flex-col items-center justify-center text-center p-6 gap-3">
+                  <p className="text-sm text-muted-foreground">{materialPreview.message || "Preview not available."}</p>
+                  {materialPreview.fallbackUrl ? (
+                    <a
+                      href={materialPreview.fallbackUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary hover:underline"
+                    >
+                      Open in new tab
+                    </a>
+                  ) : null}
+                </div>
+              ) : materialPreview.previewType === "pptx" && materialPreview.url ? (
+                <div className="h-full p-3 bg-muted/20">
+                  <PptxViewer src={materialPreview.url} width={1280} height={720} />
+                </div>
+              ) : materialPreview.url ? (
+                <iframe
+                  title={materialPreview.title || "Material preview"}
+                  src={materialPreview.url}
+                  className="w-full h-full border-0"
+                />
+              ) : (
+                <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
+                  No preview URL available.
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="px-5 pb-5 border-t border-border pt-4 flex justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setMaterialPreview((prev) => ({ ...prev, open: false }))}
+            >
+              Close
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
 
