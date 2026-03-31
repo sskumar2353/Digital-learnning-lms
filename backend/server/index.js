@@ -1949,6 +1949,8 @@ const QUIZ_API_URL = (process.env.QUIZ_API_URL || "https://quiz-1-qo31.onrender.
 // Keep live-quiz usable in production even if AI service is temporarily unavailable.
 // Set ALLOW_PLACEHOLDER_QUIZ=false only if you want strict AI-only behavior.
 const ALLOW_PLACEHOLDER_QUIZ = String(process.env.ALLOW_PLACEHOLDER_QUIZ || "true").toLowerCase() === "true";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 const QUIZ_FETCH_TIMEOUT_MS = 8000; // fail fast so UI doesn't hang 30+ seconds
 const STATIC_SOCIAL_CH1_TOPIC_IDS = new Set([645, 646, 647, 648, 649, 650, 651, 652]);
@@ -2049,6 +2051,82 @@ function staticSocialChapter1Questions(topicName) {
   ];
 }
 
+function normalizeQuizQuestions(rawQuestions) {
+  if (!Array.isArray(rawQuestions)) return [];
+  return rawQuestions
+    .map((q, i) => ({
+      question_text: String(q?.question_text || q?.questionText || `Question ${i + 1}`).slice(0, 2000),
+      option_a: String(q?.option_a || q?.optionA || "A").slice(0, 512),
+      option_b: String(q?.option_b || q?.optionB || "B").slice(0, 512),
+      option_c: String(q?.option_c || q?.optionC || "C").slice(0, 512),
+      option_d: String(q?.option_d || q?.optionD || "D").slice(0, 512),
+      correct_option: String(q?.correct_option || q?.correctOption || "A").toUpperCase().trim().charAt(0) || "A",
+      explanation: String(q?.explanation || "").slice(0, 1000),
+    }))
+    .filter((q) =>
+      q.question_text &&
+      q.option_a &&
+      q.option_b &&
+      q.option_c &&
+      q.option_d &&
+      ["A", "B", "C", "D"].includes(q.correct_option)
+    );
+}
+
+async function fetchQuizQuestionsFromGroq(topicName, subjectName, grade = 10) {
+  if (!GROQ_API_KEY) return [];
+  const prompt = [
+    "Generate exactly 10 classroom MCQs as pure JSON only.",
+    `Subject: ${subjectName || "General"}`,
+    `Grade: ${grade}`,
+    `Topic: ${topicName}`,
+    "Output format:",
+    '{ "questions": [ { "question_text": "...", "option_a": "...", "option_b": "...", "option_c": "...", "option_d": "...", "correct_option": "A|B|C|D", "explanation": "..." } ] }',
+    "Rules:",
+    "- No markdown, no code fences, no extra text.",
+    "- Use clear school-level questions from the topic.",
+    "- Keep each option plausible; one correct answer only.",
+  ].join("\n");
+
+  try {
+    const r = await fetch(GROQ_CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        temperature: 0.2,
+        max_tokens: 2600,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) return [];
+    const data = await r.json();
+    const content = String(data?.choices?.[0]?.message?.content || "").trim();
+    if (!content) return [];
+
+    // Try direct JSON parse first, then recover from fenced or prefixed output.
+    let parsed = null;
+    try {
+      parsed = JSON.parse(content);
+    } catch (_) {
+      const first = content.indexOf("{");
+      const last = content.lastIndexOf("}");
+      if (first >= 0 && last > first) {
+        try {
+          parsed = JSON.parse(content.slice(first, last + 1));
+        } catch (_) {}
+      }
+    }
+    const normalized = normalizeQuizQuestions(parsed?.questions || []);
+    return normalized;
+  } catch (_) {
+    return [];
+  }
+}
+
 async function fetchQuizQuestions(topicName, subjectName, grade = 10, meta = {}) {
   const topicIdNum = meta && meta.topicId != null ? Number(meta.topicId) : null;
   const subjectText = String(subjectName || "").toLowerCase();
@@ -2087,6 +2165,12 @@ async function fetchQuizQuestions(topicName, subjectName, grade = 10, meta = {})
     }
   } catch (_) {
     // external quiz API not available or timeout
+  }
+  try {
+    const groqQs = await fetchQuizQuestionsFromGroq(topicName, subjectName, grade);
+    if (Array.isArray(groqQs) && groqQs.length > 0) return groqQs;
+  } catch (_) {
+    // GROQ unavailable
   }
   return [];
 }
@@ -3532,8 +3616,6 @@ app.put("/api/topics/:id/ppt", async (req, res) => {
 });
 
 // ---------- AI Chatbot via GROQ (key from env; do not commit real key) ----------
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 app.post("/api/chat/ask", async (req, res) => {
   const { question } = req.body || {};
