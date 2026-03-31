@@ -608,8 +608,8 @@ app.post("/api/auth/login/student", async (req, res) => {
   try {
     const db = getPool();
     const [rows] = await db.query(
-      "SELECT id, first_name, last_name, school_id, password FROM students WHERE id = ? LIMIT 1",
-      [numericId]
+      "SELECT id, first_name, last_name, school_id, password FROM students WHERE id = ? OR roll_no = ? LIMIT 1",
+      [numericId, sid]
     );
     const student = Array.isArray(rows) && rows[0] ? rows[0] : null;
     if (student) {
