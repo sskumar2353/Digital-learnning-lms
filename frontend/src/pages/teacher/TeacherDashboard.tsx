@@ -1392,7 +1392,29 @@ const TeacherDashboard = () => {
                   <CardTitle className="text-sm font-display">Live Progress</CardTitle>
                   <Button size="sm" variant="outline" onClick={handleEndLiveQuiz}>End Quiz</Button>
                 </CardHeader>
-                <CardContent className="space-y-3 max-h-[42dvh] sm:max-h-[46dvh] overflow-y-auto pb-2">
+                <CardContent className="space-y-3 max-h-[56dvh] md:max-h-[46dvh] overflow-y-auto pb-2 min-h-0">
+                  {liveQuizCurrentQuestion?.question && (
+                    <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
+                      <p className="text-[11px] font-semibold text-foreground uppercase tracking-wide">
+                        Question {liveQuizCurrentQuestion.index} of {liveQuizSession?.questions?.length ?? "—"}
+                      </p>
+                      <p className="text-sm text-foreground leading-snug">{liveQuizCurrentQuestion.question.questionText}</p>
+                      <ul className="text-xs text-muted-foreground space-y-1 grid gap-1 sm:grid-cols-2">
+                        <li>
+                          <span className="font-medium text-foreground">A.</span> {liveQuizCurrentQuestion.question.optionA}
+                        </li>
+                        <li>
+                          <span className="font-medium text-foreground">B.</span> {liveQuizCurrentQuestion.question.optionB}
+                        </li>
+                        <li>
+                          <span className="font-medium text-foreground">C.</span> {liveQuizCurrentQuestion.question.optionC}
+                        </li>
+                        <li>
+                          <span className="font-medium text-foreground">D.</span> {liveQuizCurrentQuestion.question.optionD}
+                        </li>
+                      </ul>
+                    </div>
+                  )}
                   {liveQuizCaptureMode === "manual" && (
                     <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
                       <p className="text-xs font-medium text-foreground">
@@ -1410,7 +1432,7 @@ const TeacherDashboard = () => {
                                 <p className="text-xs text-foreground font-medium">{s.rollNo}. {s.name}</p>
                                 <Badge variant="outline">{picked || "Not set"}</Badge>
                               </div>
-                              <div className="grid grid-cols-4 gap-1">
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1">
                                 {(["A", "B", "C", "D"] as const).map((opt) => (
                                   <Button
                                     key={`${s.id}_${opt}`}
@@ -1453,28 +1475,6 @@ const TeacherDashboard = () => {
                           </Button>
                         </div>
                       </div>
-                    </div>
-                  )}
-                  {liveQuizCurrentQuestion?.question && (
-                    <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
-                      <p className="text-[11px] font-semibold text-foreground uppercase tracking-wide">
-                        Question {liveQuizCurrentQuestion.index} of {liveQuizSession?.questions?.length ?? "—"}
-                      </p>
-                      <p className="text-sm text-foreground leading-snug">{liveQuizCurrentQuestion.question.questionText}</p>
-                      <ul className="text-xs text-muted-foreground space-y-1 grid gap-1 sm:grid-cols-2">
-                        <li>
-                          <span className="font-medium text-foreground">A.</span> {liveQuizCurrentQuestion.question.optionA}
-                        </li>
-                        <li>
-                          <span className="font-medium text-foreground">B.</span> {liveQuizCurrentQuestion.question.optionB}
-                        </li>
-                        <li>
-                          <span className="font-medium text-foreground">C.</span> {liveQuizCurrentQuestion.question.optionC}
-                        </li>
-                        <li>
-                          <span className="font-medium text-foreground">D.</span> {liveQuizCurrentQuestion.question.optionD}
-                        </li>
-                      </ul>
                     </div>
                   )}
                   <p className="text-xs text-muted-foreground">

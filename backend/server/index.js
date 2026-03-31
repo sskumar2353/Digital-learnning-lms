@@ -10,6 +10,7 @@ import { execFile, exec } from "child_process";
 import { promisify } from "util";
 import QRCode from "qrcode";
 import archiver from "archiver";
+import JSZip from "jszip";
 import { toId, isConnectionError } from "./utils.js";
 import * as assetStorage from "./storage.js";
 
@@ -2051,6 +2052,76 @@ function staticSocialChapter1Questions(topicName) {
   ];
 }
 
+function decodeXmlEntities(text) {
+  return String(text || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function extractPptxSlideText(xml) {
+  const matches = [];
+  const re = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
+  let m;
+  while ((m = re.exec(String(xml || ""))) !== null) {
+    const t = decodeXmlEntities(m[1]).trim();
+    if (t) matches.push(t);
+  }
+  return matches.join(" ");
+}
+
+function slideOrder(a, b) {
+  const an = Number(String(a).match(/slide(\d+)\.xml$/)?.[1] || 0);
+  const bn = Number(String(b).match(/slide(\d+)\.xml$/)?.[1] || 0);
+  return an - bn;
+}
+
+async function fetchTopicPptContextText(meta = {}) {
+  const topicIdNum = meta && meta.topicId != null ? Number(meta.topicId) : null;
+  if (!topicIdNum || Number.isNaN(topicIdNum)) return "";
+  try {
+    const db = getPool();
+    const [rows] = await db.query(
+      `SELECT COALESCE(tpm.ppt_url, t.topic_ppt_path) AS ppt_path
+       FROM topics t
+       LEFT JOIN (
+         SELECT topic_id, MAX(id) AS latest_id
+         FROM topic_ppt_materials
+         GROUP BY topic_id
+       ) latest_tpm ON latest_tpm.topic_id = t.id
+       LEFT JOIN topic_ppt_materials tpm ON tpm.id = latest_tpm.latest_id
+       WHERE t.id = ?
+       LIMIT 1`,
+      [topicIdNum]
+    );
+    const pptPath = rows && rows[0] ? String(rows[0].ppt_path || "").trim() : "";
+    if (!pptPath || !/\.pptx$/i.test(pptPath)) return "";
+
+    const buf = await assetStorage.readUploadBuffer(pptPath);
+    if (!buf) return "";
+
+    const zip = await JSZip.loadAsync(buf);
+    const slideNames = Object.keys(zip.files)
+      .filter((n) => /^ppt\/slides\/slide\d+\.xml$/i.test(n))
+      .sort(slideOrder)
+      .slice(0, 12);
+    if (!slideNames.length) return "";
+
+    const chunks = [];
+    for (const name of slideNames) {
+      const xml = await zip.files[name].async("string");
+      const text = extractPptxSlideText(xml);
+      if (text) chunks.push(text);
+    }
+    return chunks.join("\n").slice(0, 7000);
+  } catch (err) {
+    console.warn("[quiz] PPT context extraction failed:", err?.message || String(err));
+    return "";
+  }
+}
+
 function normalizeQuizQuestions(rawQuestions) {
   if (!Array.isArray(rawQuestions)) return [];
   return rawQuestions
@@ -2073,13 +2144,14 @@ function normalizeQuizQuestions(rawQuestions) {
     );
 }
 
-async function fetchQuizQuestionsFromGroq(topicName, subjectName, grade = 10) {
+async function fetchQuizQuestionsFromGroq(topicName, subjectName, grade = 10, pptContextText = "") {
   if (!GROQ_API_KEY) return [];
   const prompt = [
     "Generate exactly 10 classroom MCQs as pure JSON only.",
     `Subject: ${subjectName || "General"}`,
     `Grade: ${grade}`,
     `Topic: ${topicName}`,
+    pptContextText ? `PPT reference text:\n${pptContextText}` : "No PPT reference text available.",
     "Output format:",
     '{ "questions": [ { "question_text": "...", "option_a": "...", "option_b": "...", "option_c": "...", "option_d": "...", "correct_option": "A|B|C|D", "explanation": "..." } ] }',
     "Rules:",
@@ -2139,6 +2211,7 @@ async function fetchQuizQuestions(topicName, subjectName, grade = 10, meta = {})
     liveQuizCheckpoint("fetchQuizQuestions:static_social_ch1", { topicId: topicIdNum, topicName, count: staticQs.length });
     return staticQs;
   }
+  const pptContextText = await fetchTopicPptContextText(meta);
   const body = { topic_name: topicName, subject: subjectName, grade };
   const opts = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   const fetchWithTimeout = (url) => {
@@ -2167,7 +2240,7 @@ async function fetchQuizQuestions(topicName, subjectName, grade = 10, meta = {})
     // external quiz API not available or timeout
   }
   try {
-    const groqQs = await fetchQuizQuestionsFromGroq(topicName, subjectName, grade);
+    const groqQs = await fetchQuizQuestionsFromGroq(topicName, subjectName, grade, pptContextText);
     if (Array.isArray(groqQs) && groqQs.length > 0) return groqQs;
   } catch (_) {
     // GROQ unavailable
