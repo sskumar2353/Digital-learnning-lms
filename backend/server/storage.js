@@ -7,11 +7,21 @@ const localRoot = process.env.UPLOADS_DIR
   : path.join(process.cwd(), "uploads");
 const bucket = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
 const region = process.env.AWS_REGION || "us-east-1";
+const endpoint = (process.env.S3_ENDPOINT || process.env.AWS_S3_ENDPOINT || "").trim();
+const forcePathStyle =
+  process.env.S3_FORCE_PATH_STYLE === "1" || process.env.S3_FORCE_PATH_STYLE === "true";
 
 let s3Client = null;
 
 function getS3() {
-  if (!s3Client) s3Client = new S3Client({ region });
+  if (!s3Client) {
+    const options = {
+      region,
+      ...(endpoint ? { endpoint } : {}),
+      ...(forcePathStyle ? { forcePathStyle: true } : {}),
+    };
+    s3Client = new S3Client(options);
+  }
   return s3Client;
 }
 

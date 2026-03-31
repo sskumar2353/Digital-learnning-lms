@@ -20,11 +20,11 @@ This app uses **MySQL** for relational data. **File binaries** (QR PNGs, chapter
 
 The server enables TLS automatically when the hostname contains `rds.amazonaws.com`, or set `MYSQL_SSL=1`. If you see certificate errors, set `MYSQL_SSL_REJECT_UNAUTHORIZED=0` (less strict; use only if needed).
 
-## 2. Amazon S3 (uploads)
+## 2. Object storage for uploads (AWS S3 or compatible)
 
-1. Create a bucket (e.g. `your-school-lms-uploads`) in the same region you will use for the SDK.
-2. Create an IAM user with programmatic access and a policy allowing `s3:PutObject`, `s3:GetObject`, `s3:HeadObject` on `arn:aws:s3:::your-bucket/*` (and `ListBucket` on the bucket if you use console sync).
-3. The app does **not** require public bucket ACLs: the Render service reads objects with the IAM key and streams them over `/uploads/*`.
+1. Create a bucket (e.g. `your-school-lms-uploads`) in the storage provider.
+2. Create access keys with permissions for object read/write (`PutObject`, `GetObject`, `HeadObject` equivalent).
+3. The app does **not** require public bucket ACLs: the Render service reads objects with the key and streams them over `/uploads/*`.
 
 **Migrating your whole local `uploads` folder (matches DB paths):**
 
@@ -40,7 +40,16 @@ Or use AWS CLI:
 aws s3 sync ./uploads s3://your-bucket/
 ```
 
-Keys in S3 must match DB paths (e.g. `textbook/foo.pdf`, `qrcodes/1_DATA.png`). The server logs on startup whether it is using **S3** or **local** `[uploads] Storage: ...`.
+Keys in object storage must match DB paths (e.g. `textbook/foo.pdf`, `qrcodes/1_DATA.png`). The server logs on startup whether it is using **S3** or **local** `[uploads] Storage: ...`.
+
+### Cloudflare R2 example env vars
+
+- `S3_BUCKET=<bucket-name>`
+- `AWS_REGION=auto`
+- `S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com`
+- `S3_FORCE_PATH_STYLE=1`
+- `AWS_ACCESS_KEY_ID=<r2-access-key-id>`
+- `AWS_SECRET_ACCESS_KEY=<r2-secret>`
 
 ## 3. Render (Node web service)
 
