@@ -23,7 +23,10 @@ const jsonLimitBytes = 100 * 1024 * 1024; // 100 MB
 app.use(express.json({ limit: jsonLimitBytes }));
 app.use(express.urlencoded({ extended: true, limit: jsonLimitBytes }));
 
-const uploadsDir = path.join(process.cwd(), "uploads");
+/** Set UPLOADS_DIR on Render when using a Persistent Disk (e.g. /var/data/uploads). */
+const uploadsDir = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 const qrcodesDir = path.join(uploadsDir, "qrcodes");
 const textbookDir = path.join(uploadsDir, "textbook");

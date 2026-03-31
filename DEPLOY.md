@@ -45,8 +45,10 @@ Keys in S3 must match DB paths (e.g. `textbook/foo.pdf`, `qrcodes/1_DATA.png`). 
 ## 3. Render (Node web service)
 
 1. New **Web Service**, connect your Git repo.
-2. **Build command:** `npm ci && npm run build`
+2. **Build command:** `npm install --include=dev && npm run build`  
+   (Required so **Vite** and other devDependencies are installed; otherwise you get `vite: not found`.)
 3. **Start command:** `npm start`
+4. **Uploads without AWS:** add a **Persistent Disk**, mount e.g. `/var/data`, then set env `UPLOADS_DIR=/var/data/uploads`. Copy your local `uploads/` contents into that disk once (or re-upload files in the app). Without a disk or S3, `/uploads/...` will 404 after deploy.
 4. **Environment** (minimum):
 
 | Variable | Example / note |

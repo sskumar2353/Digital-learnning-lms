@@ -2,7 +2,9 @@ import fs from "fs";
 import path from "path";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 
-const localRoot = path.join(process.cwd(), "uploads");
+const localRoot = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(process.cwd(), "uploads");
 const bucket = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
 const region = process.env.AWS_REGION || "us-east-1";
 

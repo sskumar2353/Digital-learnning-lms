@@ -9,6 +9,7 @@
     "server": "node backend/server/index.js",
     "start": "node backend/server/index.js",
     "build": "vite build",
+    "render-build": "npm install --include=dev && npm run build",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",

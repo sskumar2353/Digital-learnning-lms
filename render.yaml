@@ -4,7 +4,8 @@ services:
     name: digital-learning-lms
     runtime: node
     plan: starter
-    buildCommand: npm ci && npm run build
+    # DevDependencies (vite) required for `npm run build`; Render's production install skips them otherwise.
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
     envVars:
       - key: NODE_ENV
