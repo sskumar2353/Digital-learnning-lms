@@ -132,7 +132,7 @@ const AI_API_BASE = (
     ? String(import.meta.env.VITE_AI_API_URL).trim()
     : import.meta.env?.DEV
       ? "http://127.0.0.1:8000"
-      : ""
+      : getApiBase()
 ).replace(/\/$/, "");
 const AI_API_BASE_CANDIDATES = Array.from(
   new Set(

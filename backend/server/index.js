@@ -1946,7 +1946,9 @@ app.post("/api/topic-recommendations", async (req, res) => {
 // ---------- Live quiz (AI-generated MCQs; student answers; leaderboard; result analysis) ----------
 const AI_API_BASE = process.env.AI_API_BASE || "http://localhost:8000";
 const QUIZ_API_URL = (process.env.QUIZ_API_URL || "https://quiz-1-qo31.onrender.com").replace(/\/$/, "");
-const ALLOW_PLACEHOLDER_QUIZ = String(process.env.ALLOW_PLACEHOLDER_QUIZ || "").toLowerCase() === "true";
+// Keep live-quiz usable in production even if AI service is temporarily unavailable.
+// Set ALLOW_PLACEHOLDER_QUIZ=false only if you want strict AI-only behavior.
+const ALLOW_PLACEHOLDER_QUIZ = String(process.env.ALLOW_PLACEHOLDER_QUIZ || "true").toLowerCase() === "true";
 
 const QUIZ_FETCH_TIMEOUT_MS = 8000; // fail fast so UI doesn't hang 30+ seconds
 const STATIC_SOCIAL_CH1_TOPIC_IDS = new Set([645, 646, 647, 648, 649, 650, 651, 652]);
@@ -2131,6 +2133,64 @@ app.post("/generate_quiz", async (req, res) => {
   } catch (err) {
     console.error("POST /generate_quiz error:", err);
     res.status(500).json({ error: String(err.message) });
+  }
+});
+
+// ---------- Recommendations fallback endpoint ----------
+// Frontend can call this on the same backend host so recommendations still work
+// even when a dedicated AI service is down/not deployed.
+app.post("/recommend", async (req, res) => {
+  const { topic, chapter, subject, grade, query } = req.body || {};
+  const topicText = String(topic || query || chapter || subject || "lesson").trim();
+  const gradeText = grade != null ? String(grade) : "10";
+  const fallbackVideos = [
+    { title: `${topicText} - quick concept video`, url: "https://www.youtube.com/watch?v=D1Ymc311XS8", description: `Fallback recommendation for ${topicText}` },
+    { title: `${topicText} - worked examples`, url: "https://www.youtube.com/watch?v=gDjeEWpyoRA", description: `Fallback recommendation for class ${gradeText}` },
+    { title: `${topicText} - revision`, url: "https://www.youtube.com/watch?v=dAF5FngVa7A", description: `Fallback recommendation for ${subject || "subject"}` },
+  ];
+
+  const payload = {
+    topic: topicText,
+    chapter: String(chapter || "").trim(),
+    subject: String(subject || "").trim(),
+    grade: Number.isFinite(Number(grade)) ? Number(grade) : 10,
+    query: String(query || topicText).trim(),
+  };
+  const opts = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+  const fetchWithTimeout = (url) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
+  };
+
+  try {
+    // 1) Try local AI service
+    try {
+      const local = await fetchWithTimeout(`${AI_API_BASE.replace(/\/$/, "")}/recommend`);
+      if (local.ok) {
+        const data = await local.json();
+        if (data && (Array.isArray(data.videos) || Array.isArray(data.resources))) {
+          return res.json(data);
+        }
+      }
+    } catch (_) {}
+
+    // 2) Try external quiz/recommendation service (if it exposes /recommend)
+    try {
+      const ext = await fetchWithTimeout(`${QUIZ_API_URL}/recommend`);
+      if (ext.ok) {
+        const data = await ext.json();
+        if (data && (Array.isArray(data.videos) || Array.isArray(data.resources))) {
+          return res.json(data);
+        }
+      }
+    } catch (_) {}
+
+    // 3) Guaranteed fallback videos
+    return res.json({ videos: fallbackVideos, resources: [] });
+  } catch (err) {
+    console.error("POST /recommend error:", err);
+    return res.json({ videos: fallbackVideos, resources: [] });
   }
 });
 
