@@ -515,6 +515,9 @@ const TeacherDashboard = () => {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
+                  topicId: activeSession.topicId,
+                  chapterId: activeSession.chapterId,
+                  subjectId: activeSession.subjectId,
                   topic: activeSession.topicName,
                   chapter: selectedChapterObj?.name || "",
                   subject: currentSubject.name,
@@ -538,7 +541,9 @@ const TeacherDashboard = () => {
         }
         if (!res.ok) throw new Error("Recommendation service unavailable");
         const data = await res.json() as { videos?: YouTubeReco[]; resources?: ResourceReco[] };
-        const videos = (data.videos || []).filter((v) => /^https:\/\/www\.youtube\.com\/watch\?v=/.test(String(v.url || ""))).slice(0, 5);
+        const videos = (data.videos || [])
+          .filter((v) => /^https:\/\/www\.youtube\.com\/(watch\?v=|results\?search_query=)/.test(String(v.url || "")))
+          .slice(0, 8);
         if (!cancelled) {
           setYoutubeRecs(videos);
           if (videos.length < 1) setYoutubeRecError("No videos found for this lesson context; showing fallback links.");
@@ -1277,6 +1282,24 @@ const TeacherDashboard = () => {
                 </CardTitle>
               </CardHeader>
               <CardContent>
+                {!attendanceMarked && (
+                  <div className="mb-2 flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => {
+                        const allPresent = Object.fromEntries(classStudents.map((s) => [s.id, true]));
+                        setSessionAttendance(allPresent);
+                      }}
+                    >
+                      Mark all present
+                    </Button>
+                    <span className="text-[11px] text-muted-foreground">
+                      Then uncheck only absentees.
+                    </span>
+                  </div>
+                )}
                 <div className="space-y-1.5 max-h-48 overflow-y-auto">
                   {classStudents.map((s) => (
                     <label key={s.id} className="flex items-center gap-2 p-1.5 rounded-lg hover:bg-secondary cursor-pointer">

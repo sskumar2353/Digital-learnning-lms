@@ -1908,7 +1908,7 @@ app.post("/api/topic-recommendations", async (req, res) => {
     }
     let orderNum = 0;
     for (const v of (videos || []).slice(0, 10)) {
-      if (v && v.url && !String(v.url).startsWith("https://www.youtube.com/results")) {
+      if (v && v.url) {
         await db.query(
           "INSERT INTO topic_recommendation_links (topic_recommendation_id, type, title, url, description, order_num) VALUES (?, 'youtube', ?, ?, ?, ?)",
           [recId, String(v.title || "Video").slice(0, 512), String(v.url).slice(0, 1024), String(v.description || "").slice(0, 2000), orderNum++]
@@ -2122,6 +2122,28 @@ async function fetchTopicPptContextText(meta = {}) {
   }
 }
 
+function deriveSubheadingsFromPptContext(pptContextText, topicText = "") {
+  const lines = String(pptContextText || "")
+    .split("\n")
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const picked = [];
+  const seen = new Set();
+  for (const line of lines) {
+    // Take the first segment as likely slide heading.
+    const head = line.split(/[.?!:;|-]/)[0].trim();
+    const normalized = head.toLowerCase();
+    if (!head || head.length < 6 || head.length > 110) continue;
+    if (topicText && normalized === String(topicText).toLowerCase()) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    picked.push(head);
+    if (picked.length >= 6) break;
+  }
+  if (!picked.length && topicText) return [String(topicText)];
+  return picked;
+}
+
 function normalizeQuizQuestions(rawQuestions) {
   if (!Array.isArray(rawQuestions)) return [];
   return rawQuestions
@@ -2297,21 +2319,27 @@ app.post("/generate_quiz", async (req, res) => {
 // Frontend can call this on the same backend host so recommendations still work
 // even when a dedicated AI service is down/not deployed.
 app.post("/recommend", async (req, res) => {
-  const { topic, chapter, subject, grade, query } = req.body || {};
+  const { topic, chapter, subject, grade, query, topicId, chapterId, subjectId } = req.body || {};
   const topicText = String(topic || query || chapter || subject || "lesson").trim();
   const gradeText = grade != null ? String(grade) : "10";
-  const fallbackVideos = [
-    { title: `${topicText} - quick concept video`, url: "https://www.youtube.com/watch?v=D1Ymc311XS8", description: `Fallback recommendation for ${topicText}` },
-    { title: `${topicText} - worked examples`, url: "https://www.youtube.com/watch?v=gDjeEWpyoRA", description: `Fallback recommendation for class ${gradeText}` },
-    { title: `${topicText} - revision`, url: "https://www.youtube.com/watch?v=dAF5FngVa7A", description: `Fallback recommendation for ${subject || "subject"}` },
-  ];
+  const pptContextText = await fetchTopicPptContextText({ topicId, chapterId, subjectId });
+  const subheadings = deriveSubheadingsFromPptContext(pptContextText, topicText);
+  const fallbackVideos = subheadings.map((h) => {
+    const search = `${h} ${subject || ""} class ${gradeText}`.trim();
+    return {
+      title: h,
+      url: `https://www.youtube.com/results?search_query=${encodeURIComponent(search)}`,
+      description: `From PPT subheading: ${h}`,
+    };
+  });
 
   const payload = {
     topic: topicText,
     chapter: String(chapter || "").trim(),
     subject: String(subject || "").trim(),
     grade: Number.isFinite(Number(grade)) ? Number(grade) : 10,
-    query: String(query || topicText).trim(),
+      query: String(query || topicText).trim(),
+      ppt_context: pptContextText || undefined,
   };
   const opts = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
   const fetchWithTimeout = (url) => {
